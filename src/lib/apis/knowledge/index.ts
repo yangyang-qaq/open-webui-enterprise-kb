@@ -1100,7 +1100,7 @@ export const deleteKnowledgeDirectory = async (
 // Enterprise Knowledge Dashboard – Chunk APIs
 // ────────────────────────────────────────────────────
 
-export const previewKnowledgeChunks = async (token: string, id: string, fileId: string) => {
+export const previewKnowledgeChunks = async (token: string, id: string, fileId: string, method: string = 'general') => {
 	let error = null;
 
 	const res = await fetch(`${WEBUI_API_BASE_URL}/knowledge/${id}/chunks/preview`, {
@@ -1110,7 +1110,7 @@ export const previewKnowledgeChunks = async (token: string, id: string, fileId: 
 			'Content-Type': 'application/json',
 			authorization: `Bearer ${token}`
 		},
-		body: JSON.stringify({ file_id: fileId })
+		body: JSON.stringify({ file_id: fileId, method })
 	})
 		.then(async (res) => {
 			if (!res.ok) throw await res.json();

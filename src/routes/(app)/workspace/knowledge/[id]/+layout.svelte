@@ -19,6 +19,8 @@
 		else if (path.endsWith('/processing')) activeTab = 'processing';
 		else if (path.endsWith('/evaluate')) activeTab = 'evaluate';
 		else if (path.endsWith('/snapshots')) activeTab = 'snapshots';
+		else if (path.endsWith('/agents')) activeTab = 'agents';
+		else if (path.endsWith('/agents')) activeTab = 'agents';
 		else activeTab = 'files';
 	}
 </script>
@@ -32,7 +34,7 @@
 				? 'bg-white dark:bg-gray-900 text-blue-600 dark:text-blue-400 border-b-2 border-blue-600'
 				: 'text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200'}"
 		>
-			📁 Files
+			📁 文件
 		</button>
 		<button
 			on:click={() => navigateTo('chunks')}
@@ -40,7 +42,7 @@
 				? 'bg-white dark:bg-gray-900 text-blue-600 dark:text-blue-400 border-b-2 border-blue-600'
 				: 'text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200'}"
 		>
-			🧩 Chunks
+			🧩 分块
 		</button>
 		<button
 			on:click={() => navigateTo('processing')}
@@ -48,7 +50,7 @@
 				? 'bg-white dark:bg-gray-900 text-blue-600 dark:text-blue-400 border-b-2 border-blue-600'
 				: 'text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200'}"
 		>
-			⏳ Processing
+			⏳ 处理
 		</button>
 		<button
 			on:click={() => navigateTo('evaluate')}
@@ -56,7 +58,7 @@
 				? 'bg-white dark:bg-gray-900 text-blue-600 dark:text-blue-400 border-b-2 border-blue-600'
 				: 'text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200'}"
 		>
-			📊 Evaluate
+			📊 评估
 		</button>
 		<button
 			on:click={() => navigateTo('snapshots')}
@@ -64,8 +66,16 @@
 				? 'bg-white dark:bg-gray-900 text-blue-600 dark:text-blue-400 border-b-2 border-blue-600'
 				: 'text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200'}"
 		>
-			📸 Snapshots
+			📸 快照
 		</button>
+t		<button
+				on:click={() => navigateTo("agents")}
+				class="px-4 py-2 text-sm font-medium rounded-t-lg transition {activeTab === "agents"
+					? "bg-white dark:bg-gray-900 text-blue-600 dark:text-blue-400 border-b-2 border-blue-600"
+					: "text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"}"
+			>
+				🤖 Agents
+			</button>
 	</div>
 
 	<!-- Page Content -->

@@ -1336,9 +1336,10 @@ class KnowledgeSnapshotCompareResult(BaseModel):
 
 
 class KnowledgeChunkPreviewForm(BaseModel):
-    """Request form for chunk preview - takes a file_id to preview chunking."""
+    """Request form for chunk preview - takes a file_id and optional chunking method."""
 
     file_id: str
+    method: str = 'general'
 
 
 class KnowledgeRelevanceAnnotationForm(BaseModel):
@@ -1360,3 +1361,74 @@ class KnowledgeSnapshotCompareForm(BaseModel):
 
     snapshot_a_id: str
     snapshot_b_id: str
+
+
+# Phase 8: Agent Workflow Models
+
+AGENT_ROLES = {
+    'retriever': {'name': '检索员', 'icon': '🔍', 'default_prompt': '从知识库中检索与问题相关的文档内容。'},
+    'analyst': {'name': '分析员', 'icon': '🧠', 'default_prompt': '请根据上面检索到的文档内容，提炼出与用户问题最相关的关键信息。对于每个关键发现，必须引用原文中的具体段落或句子作为依据。只基于提供的文档内容回答，不要编造信息。'},
+    'reporter': {'name': '汇报员', 'icon': '📝', 'default_prompt': '请根据上面的分析结果，生成一份结构化的中文报告。格式要求：1.摘要 2.核心观点（逐条列出，标注引用来源）3.详细说明 4.参考文档列表。只基于提供的分析内容，不要编造信息。'},
+    'validator': {'name': '校验员', 'icon': '✅', 'default_prompt': '你的任务是对比"检索到的原始文档"和"分析员的分析结论"，逐条核查分析结论是否与原文一致。\n\n核查规则：\n1. 逐条检查分析结论中的每一个观点，在原文中找到对应段落进行比对\n2. 如果原文明确支持该观点，标记为"✅ 一致"\n3. 如果原文与观点矛盾，标记为"❌ 不一致"，并引用原文作为证据\n4. 如果原文未涉及该观点，标记为"⚠️ 原文未提及"\n5. 最后给出总体一致性评分（百分比）。\n\n请先列出原文关键信息，再逐条对比分析结论。'},
+    'translator': {'name': '翻译员', 'icon': '🌐', 'default_prompt': '将内容翻译为目标语言，保持原意。'},
+}
+
+AGENT_ROLES_LIST = [{'id': k, **v} for k, v in AGENT_ROLES.items()]
+
+
+class AgentWorkflow(Base):
+    __tablename__ = 'agent_workflow'
+    id = Column(Text, unique=True, primary_key=True)
+    user_id = Column(Text, nullable=False)
+    name = Column(Text, nullable=False)
+    description = Column(Text, nullable=True)
+    created_at = Column(BigInteger, nullable=False)
+    updated_at = Column(BigInteger, nullable=False)
+
+
+class AgentWorkflowStep(Base):
+    __tablename__ = 'agent_workflow_step'
+    id = Column(Text, unique=True, primary_key=True)
+    workflow_id = Column(Text, ForeignKey('agent_workflow.id', ondelete='CASCADE'), nullable=False)
+    order_index = Column(BigInteger, nullable=False)
+    agent_role = Column(Text, nullable=False)
+    knowledge_id = Column(Text, nullable=True)
+    prompt_template = Column(Text, nullable=True)
+    input_var = Column(Text, nullable=True)
+    output_var = Column(Text, nullable=True)
+    created_at = Column(BigInteger, nullable=False)
+
+
+class AgentWorkflowModel(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    user_id: str
+    name: str
+    description: Optional[str] = None
+    steps: list[dict] = []
+    created_at: int
+    updated_at: int
+
+
+class AgentWorkflowStepModel(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    workflow_id: str
+    order_index: int
+    agent_role: str
+    knowledge_id: Optional[str] = None
+    prompt_template: Optional[str] = None
+    input_var: Optional[str] = None
+    output_var: Optional[str] = None
+    created_at: int
+
+
+class AgentWorkflowCreateForm(BaseModel):
+    name: str
+    description: Optional[str] = None
+    steps: list[dict] = []
+
+
+class AgentWorkflowExecuteForm(BaseModel):
+    query: str
+    workflow_id: str

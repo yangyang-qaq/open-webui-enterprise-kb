@@ -11,7 +11,7 @@ from typing import List, Optional
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL
 from open_webui.constants import ERROR_MESSAGES
 from open_webui.events import EVENTS, publish_event
@@ -76,6 +76,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# In-memory storage for workflow execution results (for Word download)
+_exec_results = {}
 
 ############################
 # getKnowledgeBases
@@ -1064,6 +1067,224 @@ class KnowledgeFilesResponse(KnowledgeResponse):
     write_access: bool | None = False
 
 
+# -- Phase 8: Agent Workflow (appended) --
+
+@router.get("/_workflows/roles")
+async def get_agent_roles(user=Depends(get_verified_user)):
+    from open_webui.models.knowledge import AGENT_ROLES_LIST
+    return AGENT_ROLES_LIST
+
+@router.get("/_workflows")
+async def list_workflows(user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)):
+    from open_webui.models.knowledge import AgentWorkflow, AgentWorkflowStep, AgentWorkflowModel
+    from sqlalchemy import select as sa_select
+    r = await db.execute(sa_select(AgentWorkflow).where(AgentWorkflow.user_id == user.id).order_by(AgentWorkflow.updated_at.desc()))
+    out = []
+    for wf in r.scalars().all():
+        sr = await db.execute(sa_select(AgentWorkflowStep).where(AgentWorkflowStep.workflow_id == wf.id).order_by(AgentWorkflowStep.order_index))
+        steps = [{"id": s.id, "order_index": s.order_index, "agent_role": s.agent_role, "knowledge_id": s.knowledge_id, "prompt_template": s.prompt_template, "input_var": s.input_var, "output_var": s.output_var} for s in sr.scalars().all()]
+        out.append(AgentWorkflowModel(id=wf.id, user_id=wf.user_id, name=wf.name, description=wf.description, steps=steps, created_at=wf.created_at, updated_at=wf.updated_at))
+    return out
+
+@router.post("/_workflows")
+async def create_workflow(request: Request, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)):
+    from open_webui.models.knowledge import AgentWorkflow, AgentWorkflowStep, AgentWorkflowModel
+    b = await request.json()
+    n = b.get("name", ""); d = b.get("description", ""); ss = b.get("steps", [])
+    now = int(time.time())
+    wf = AgentWorkflow(id=str(uuid.uuid4()), user_id=user.id, name=n, description=d, created_at=now, updated_at=now)
+    db.add(wf)
+    for s in ss:
+        db.add(AgentWorkflowStep(id=str(uuid.uuid4()), workflow_id=wf.id, order_index=s.get("order_index", 0), agent_role=s["agent_role"], knowledge_id=s.get("knowledge_id"), prompt_template=s.get("prompt_template"), input_var=s.get("input_var"), output_var=s.get("output_var"), created_at=now))
+    await db.commit()
+    return AgentWorkflowModel(id=wf.id, user_id=wf.user_id, name=n, description=d, steps=ss, created_at=now, updated_at=now)
+
+@router.post("/_workflows/exec")
+@router.post("/_workflows/exec")
+async def exec_workflow(request: Request, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)):
+    from open_webui.models.knowledge import AgentWorkflow, AgentWorkflowStep, AGENT_ROLES
+    from sqlalchemy import select as sa_select
+    b = await request.json()
+    wid = b.get("workflow_id", ""); q = b.get("query", "")
+    wf = (await db.execute(sa_select(AgentWorkflow).where(AgentWorkflow.id == wid))).scalars().first()
+    if not wf: raise HTTPException(status_code=404, detail="Workflow not found")
+    sr = await db.execute(sa_select(AgentWorkflowStep).where(AgentWorkflowStep.workflow_id == wf.id).order_by(AgentWorkflowStep.order_index))
+    steps = sr.scalars().all()
+    run_id = str(uuid.uuid4())
+    results = []; variables = {"query": q}
+    SSE = chr(10) + chr(10)
+    SEP = chr(10) + chr(10) + "---" + chr(10) + chr(10)
+
+    from dotenv import load_dotenv; load_dotenv(override=True); import os; OPENAI_API_BASE_URL = os.getenv("OPENAI_API_BASE_URL", "https://api.deepseek.com/v1"); OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+    api_url = OPENAI_API_BASE_URL.rstrip("/") if OPENAI_API_BASE_URL else "https://api.deepseek.com/v1"
+    api_key = OPENAI_API_KEY or ""
+
+    async def event_generator():
+        for step in steps:
+            role_info = AGENT_ROLES.get(step.agent_role, {"name": step.agent_role})
+            yield "data: " + json.dumps({"step": step.order_index, "role": role_info["name"], "status": "running"}) + SSE
+            output = ""
+            if step.agent_role == "retriever" and step.knowledge_id:
+                try:
+                    emb_fn = request.app.state.EMBEDDING_FUNCTION
+                    from open_webui.retrieval.utils import query_collection
+                    r = await query_collection(request=request, collection_names=[step.knowledge_id], queries=[q], embedding_function=emb_fn, k=15)
+                    if isinstance(r, dict) and r.get("documents") and r["documents"][0]:
+                        docs = r["documents"][0][:15]
+                        metas = r.get("metadatas", [[]])[0][:15] if r.get("metadatas") else []
+                        # Group chunks by file_id and concatenate
+                        from collections import OrderedDict
+                        file_groups = OrderedDict()
+                        for i, doc in enumerate(docs):
+                            if not doc: continue
+                            fid = ""
+                            ci = i
+                            if i < len(metas) and metas[i]:
+                                fid = metas[i].get("file_id", "")
+                                ci = metas[i].get("chunk_index", i)
+                            if fid not in file_groups:
+                                file_groups[fid] = []
+                            file_groups[fid].append((ci, doc))
+                        output = "[Retrieved " + str(len(docs)) + " chunks from " + str(len(file_groups)) + " documents]" + chr(10) + chr(10)
+                        doc_num = 0
+                        for fid, chunks in file_groups.items():
+                            doc_num += 1
+                            # Sort by chunk_index
+                            chunks.sort(key=lambda x: x[0])
+                            # Get filename
+                            src = fid[:20] if fid else "Unknown"
+                            if fid:
+                                try:
+                                    from open_webui.models.files import Files
+                                    f = await Files.get_file_by_id(fid)
+                                    if f:
+                                        src = f.filename
+                                except Exception:
+                                    pass
+                            # Concatenate chunks
+                            merged = chr(10) + chr(10).join(c[1] for c in chunks)
+                            output += chr(10) + "=== Document " + str(doc_num) + ": " + str(src) + " ===" + chr(10)
+                            output += merged[:8000] + chr(10)
+                    else:
+                        output = "(no documents found in knowledge base)"
+                except Exception as e:
+                    output = "(retrieval error: " + str(e)[:100] + ")"
+            else:
+                try:
+                    prompt_text = step.prompt_template or role_info.get("default_prompt", "")
+                    # Collect ALL previous step outputs as context
+                    context_parts = []
+                    for vn, vv in variables.items():
+                        if vn != "query" and vv and isinstance(vv, str) and len(vv) > 5:
+                            context_parts.append("[" + vn + "]: " + str(vv)[:6000])
+                    prev_context = chr(10).join(context_parts) if context_parts else ""
+                    # Build final prompt — ALWAYS include the user's question first
+                    prompt_text = "用户问题：" + q + chr(10) + chr(10)
+                    if prev_context:
+                        prompt_text += "前面步骤收集到的信息：" + chr(10) + prev_context + chr(10) + chr(10)
+                    prompt_text += "你的任务：" + role_info.get("default_prompt", "")
+                    prompt_text = prompt_text.replace("{context}", prev_context)
+                    prompt_text = prompt_text.replace("{query}", q)
+                    for vn, vv in variables.items():
+                        prompt_text = prompt_text.replace("{" + vn + "}", str(vv)[:8000])
+                    if api_key:
+                        import httpx
+                        async with httpx.AsyncClient(timeout=60) as client:
+                            resp = await client.post(
+                                api_url + "/chat/completions",
+                                headers={"Authorization": "Bearer " + api_key},
+                                json={"model": "deepseek-chat", "messages": [
+                                    {"role": "system", "content": "You are the " + role_info["name"] + ". Respond in Chinese."},
+                                    {"role": "user", "content": prompt_text[:10000]}
+                                ], "max_tokens": 2048}
+                            )
+                            if resp.status_code == 200:
+                                output = resp.json()["choices"][0]["message"]["content"]
+                            else:
+                                output = "(LLM HTTP " + str(resp.status_code) + ")"
+                    else:
+                        output = "(No API key - would call " + role_info["name"] + ")"
+                except Exception as e:
+                    output = "(LLM error: " + str(e)[:150] + ")"
+            if step.output_var:
+                variables[step.output_var] = output
+            results.append({"step": step.order_index, "role": role_info["name"], "status": "done", "output": output})
+            # SSE preview: truncated for display
+            yield "data: " + json.dumps({"step": step.order_index, "role": role_info["name"], "status": "done", "output": output[:600]}) + SSE
+        # Store full results for download
+        from open_webui.routers.knowledge import _exec_results
+        _exec_results[run_id] = {"query": q, "wf_name": wf.name, "steps": results, "ts": time.time()}
+        yield "data: " + json.dumps({"status": "done", "run_id": run_id, "results": results}) + SSE
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@router.post("/_workflows/exec/download")
+async def download_workflow_results(request: Request):
+    """Generate and download a Word document from workflow execution results."""
+    from docx import Document
+    from docx.shared import Inches, Pt, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    b = await request.json()
+    run_id = b.get("run_id", "")
+    wf_name = b.get("wf_name", "Workflow")
+    query = b.get("query", "")
+    steps = b.get("steps", [])
+    # Try to get full results from memory if run_id provided
+    if run_id and run_id in _exec_results:
+        cached = _exec_results[run_id]
+        steps = cached.get("steps", steps)
+        wf_name = cached.get("wf_name", wf_name)
+        query = cached.get("query", query)
+    doc = Document()
+    # Set default font
+    style = doc.styles['Normal']
+    font = style.font
+    font.name = 'Arial'
+    font.size = Pt(11)
+    # Title
+    title = doc.add_heading(f'{wf_name} - Execution Report', level=0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    # Metadata
+    doc.add_paragraph(f'Query: {query}')
+    from datetime import datetime
+    doc.add_paragraph(f'Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+    doc.add_paragraph('')
+    # Steps
+    for i, s in enumerate(steps):
+        role = s.get("role", f"Step {i+1}")
+        output = s.get("output", "")
+        doc.add_heading(f'{i+1}. {role}', level=2)
+        # Split output into paragraphs
+        for line in output.split(chr(10)):
+            line = line.strip()
+            if line:
+                doc.add_paragraph(line)
+        doc.add_paragraph('')
+    # Save to bytes
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    # Cleanup old entries
+    now_ts = time.time()
+    for k in list(_exec_results.keys()):
+        if now_ts - _exec_results[k].get("ts", 0) > 3600:
+            del _exec_results[k]
+    filename = f'{wf_name}_report.docx'
+    return Response(
+        content=buf.getvalue(),
+        media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        headers={'Content-Disposition': f'attachment; filename*=UTF-8\'\'{quote(filename)}'}
+    )
+
+
+@router.delete("/_workflows/{wfid}")
+async def del_workflow(wfid: str, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)):
+    from open_webui.models.knowledge import AgentWorkflow, AgentWorkflowStep
+    from sqlalchemy import delete as sa_delete
+    await db.execute(sa_delete(AgentWorkflowStep).where(AgentWorkflowStep.workflow_id == wfid))
+    await db.execute(sa_delete(AgentWorkflow).where(AgentWorkflow.id == wfid, AgentWorkflow.user_id == user.id))
+    await db.commit()
+    return {"status": True}
 @router.get('/{id}', response_model=KnowledgeFilesResponse | None)
 async def get_knowledge_by_id(id: str, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)):
     knowledge = await Knowledges.get_knowledge_by_id(id=id, db=db)
@@ -2450,6 +2671,35 @@ async def preview_knowledge_chunks(
     # Use existing loader + splitter (no embedding)
     try:
         file_path = await asyncio.to_thread(Storage.get_file, file_path)
+
+        method = getattr(form_data, 'method', None) or 'general'
+        if method and method not in ('', 'general'):
+            from open_webui.utils.chunking_strategies import chunk_document, extract_keywords, generate_questions
+            content = None
+            for enc in ('utf-8', 'gbk'):
+                try:
+                    with open(file_path, 'r', encoding=enc) as fh:
+                        content = fh.read()
+                    break
+                except Exception:
+                    pass
+            if content:
+                raw = chunk_document(content, method)
+                from sqlalchemy import delete as sa_delete
+                await db.execute(sa_delete(KnowledgeChunk).where(KnowledgeChunk.knowledge_id == id, KnowledgeChunk.file_id == form_data.file_id))
+                import hashlib
+                now = int(time.time())
+                chunks = []
+                for idx, rc in enumerate(raw):
+                    kw = extract_keywords(rc['content'])
+                    qs = generate_questions(rc['content'])
+                    h = hashlib.sha256(rc['content'].encode()).hexdigest()
+                    ck = KnowledgeChunk(id=str(uuid.uuid4()), knowledge_id=id, file_id=form_data.file_id, chunk_index=idx, content=rc['content'], token_count=len(rc['content']) // 4, content_hash=h, meta={**rc.get('metadata', {}), 'keywords': kw, 'questions': qs}, created_at=now, updated_at=now)
+                    db.add(ck)
+                    chunks.append(KnowledgeChunkModel.model_validate(ck))
+                await db.commit()
+                return chunks
+
         loader_config = await get_loader_config()
         loader = build_loader_from_config(request, loader_config)
         loader.user = user
@@ -2793,12 +3043,12 @@ async def reindex_knowledge_chunks(
     ]
 
     try:
-        await save_docs_to_vector_db(
-            request=request,
-            collection_name=id,
-            docs=docs,
-            user=user,
-            bypass_embedding=False,
+        from fastapi.concurrency import run_in_threadpool
+        config = await get_retrieval_config()
+        await run_in_threadpool(
+            save_docs_to_vector_db,
+            request, docs, id, config,
+            None, True, True, False, user,
         )
     except Exception as e:
         log.exception(e)
@@ -3031,7 +3281,7 @@ async def evaluate_retrieval_query(
         for i in range(min(k, len(docs_list))):
             doc_text = docs_list[i] if i < len(docs_list) else ''
             results.append({
-                'chunk_id': metas_list[i].get('content_hash', f'chunk-{i}') if i < len(metas_list) else f'chunk-{i}',
+                'chunk_id': f'result-{i}-' + (metas_list[i].get('content_hash', '')[:8] if i < len(metas_list) else ''),
                 'text': doc_text[:500],
                 'score': dists_list[i] if i < len(dists_list) else None,
                 'metadata': metas_list[i] if i < len(metas_list) else {},
@@ -3426,3 +3676,5 @@ async def delete_knowledge_snapshot(
     )
     await db.commit()
     return {'status': True}
+
+
