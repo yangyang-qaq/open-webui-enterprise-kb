@@ -18,8 +18,8 @@
 		if (path.endsWith('/chunks')) activeTab = 'chunks';
 		else if (path.endsWith('/processing')) activeTab = 'processing';
 		else if (path.endsWith('/evaluate')) activeTab = 'evaluate';
+		else if (path.endsWith('/faithfulness')) activeTab = 'faithfulness';
 		else if (path.endsWith('/snapshots')) activeTab = 'snapshots';
-		else if (path.endsWith('/agents')) activeTab = 'agents';
 		else if (path.endsWith('/agents')) activeTab = 'agents';
 		else activeTab = 'files';
 	}
@@ -61,6 +61,14 @@
 			📊 评估
 		</button>
 		<button
+			on:click={() => navigateTo('faithfulness')}
+			class="px-4 py-2 text-sm font-medium rounded-t-lg transition {activeTab === 'faithfulness'
+				? 'bg-white dark:bg-gray-900 text-blue-600 dark:text-blue-400 border-b-2 border-blue-600'
+				: 'text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200'}"
+		>
+			🎯 忠实度
+		</button>
+		<button
 			on:click={() => navigateTo('snapshots')}
 			class="px-4 py-2 text-sm font-medium rounded-t-lg transition {activeTab === 'snapshots'
 				? 'bg-white dark:bg-gray-900 text-blue-600 dark:text-blue-400 border-b-2 border-blue-600'
@@ -68,7 +76,7 @@
 		>
 			📸 快照
 		</button>
-t		<button
+		<button
 				on:click={() => navigateTo("agents")}
 				class="px-4 py-2 text-sm font-medium rounded-t-lg transition {activeTab === "agents"
 					? "bg-white dark:bg-gray-900 text-blue-600 dark:text-blue-400 border-b-2 border-blue-600"

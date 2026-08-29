@@ -4,15 +4,25 @@ import asyncio
 import io
 import json
 import logging
+import os
+import re
 import time
 import uuid
 import zipfile
 from typing import List, Optional
 from urllib.parse import quote
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import Response, StreamingResponse
-from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL
+from open_webui.config import (
+    BYPASS_ADMIN_ACCESS_CONTROL,
+    OPENAI_API_BASE_URL,
+    OPENAI_API_KEY,
+    RAG_OPENAI_API_BASE_URL,
+    RAG_OPENAI_API_KEY,
+    RAG_TEMPLATE,
+)
 from open_webui.constants import ERROR_MESSAGES
 from open_webui.events import EVENTS, publish_event
 from open_webui.internal.db import get_async_session
@@ -2672,17 +2682,22 @@ async def preview_knowledge_chunks(
     try:
         file_path = await asyncio.to_thread(Storage.get_file, file_path)
 
+        loader_config = await get_loader_config()
+        loader = build_loader_from_config(request, loader_config)
+        loader.user = user
+        loader.metadata = {
+            'file_id': file.id,
+            'file_name': file.filename,
+            'file_content_type': file.meta.get('content_type'),
+        }
+        docs = await loader.aload(file.filename, file.meta.get('content_type'), file_path)
+
         method = getattr(form_data, 'method', None) or 'general'
         if method and method not in ('', 'general'):
             from open_webui.utils.chunking_strategies import chunk_document, extract_keywords, generate_questions
-            content = None
-            for enc in ('utf-8', 'gbk'):
-                try:
-                    with open(file_path, 'r', encoding=enc) as fh:
-                        content = fh.read()
-                    break
-                except Exception:
-                    pass
+            # Use loader-extracted text (handles txt/pdf/docx/etc.); custom strategies
+            # fall through to the default splitter below when no text can be extracted.
+            content = '\n\n'.join(doc.page_content for doc in docs if doc.page_content)
             if content:
                 raw = chunk_document(content, method)
                 from sqlalchemy import delete as sa_delete
@@ -2699,16 +2714,6 @@ async def preview_knowledge_chunks(
                     chunks.append(KnowledgeChunkModel.model_validate(ck))
                 await db.commit()
                 return chunks
-
-        loader_config = await get_loader_config()
-        loader = build_loader_from_config(request, loader_config)
-        loader.user = user
-        loader.metadata = {
-            'file_id': file.id,
-            'file_name': file.filename,
-            'file_content_type': file.meta.get('content_type'),
-        }
-        docs = await loader.aload(file.filename, file.meta.get('content_type'), file_path)
 
         # Chunk using same logic as save_docs_to_vector_db
         config = await get_retrieval_config()
@@ -2772,6 +2777,7 @@ async def preview_knowledge_chunks(
 
         # Persist chunks in knowledge_chunk table
         import hashlib
+        from open_webui.utils.chunking_strategies import extract_keywords, generate_questions
         now = int(time.time())
         chunks = []
         for idx, doc in enumerate(docs):
@@ -2785,7 +2791,7 @@ async def preview_knowledge_chunks(
                 chunk_index=idx,
                 content=doc.page_content,
                 token_count=token_count,
-                meta=doc.metadata,
+                meta={**doc.metadata, 'keywords': extract_keywords(doc.page_content), 'questions': generate_questions(doc.page_content)},
                 content_hash=content_hash,
                 created_at=now,
                 updated_at=now,
@@ -3260,12 +3266,15 @@ async def evaluate_retrieval_query(
     k = form_data.k if form_data.k else 10
 
     try:
+        # 评估走生产真实链路（混合检索 + Cross-Encoder 重排），但重排后返回完整 k 条
+        # （而非 top_k_reranker=3 截断），否则 recall@K/precision@K/MRR 会被截断失真。
         result = await query_collection(
             request=request,
             collection_names=[id],
             queries=[form_data.query],
             embedding_function=request.app.state.EMBEDDING_FUNCTION,
             k=k,
+            k_reranker=k,
         )
     except Exception as e:
         log.exception(e)
@@ -3422,6 +3431,253 @@ async def delete_evaluation_judgments(
     )
     await db.commit()
     return {'status': True}
+
+
+# ─────────────────────────────────────────────────────────────
+# Enterprise Knowledge Dashboard – Phase 11: Faithfulness (LLM-as-judge)
+# ─────────────────────────────────────────────────────────────
+
+_JUDGE_SYSTEM = (
+    "You are a strict fact-checker evaluating the faithfulness of a RAG answer. "
+    "Judge whether each claim in the answer is supported by the provided context. "
+    "Use ONLY the context, never outside knowledge. Output ONLY a valid JSON object, no markdown fences."
+)
+
+_JUDGE_PROMPT = """Given a question, the retrieved context (inside <source> tags), and a generated answer:
+
+1. Decompose the answer into a list of atomic claims (each is a single verifiable statement).
+2. For each claim, set "supported":
+   - "yes"         → the context directly supports the claim;
+   - "no"          → the context contradicts the claim;
+   - "insufficient" → the context does not mention enough to verify the claim.
+3. If the answer is a refusal (e.g. says the information is not found), output an empty claims list.
+
+Output a JSON object exactly in this shape:
+{{"claims": [{{"text": "...", "supported": "yes|no|insufficient", "evidence": "..."}}]}}
+
+Question: {question}
+
+Context:
+{context}
+
+Answer:
+{answer}
+"""
+
+
+def _faithfulness_api() -> tuple[str, str, str]:
+    """返回 (base_url, api_key, model)。优先 .env 直读（对齐 exec_workflow），回退全局配置，默认 DeepSeek。"""
+    # config.* 常量在模块导入时取值，可能早于 env.py 加载 .env 而为空；
+    # 这里与 exec_workflow 一致：显式 load_dotenv(override=True) 后直读 os.getenv。
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(override=True)
+    except ImportError:
+        pass
+    base = (
+        os.getenv("RAG_OPENAI_API_BASE_URL")
+        or os.getenv("OPENAI_API_BASE_URL")
+        or RAG_OPENAI_API_BASE_URL
+        or OPENAI_API_BASE_URL
+        or "https://api.deepseek.com/v1"
+    ).rstrip("/")
+    key = os.getenv("RAG_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY") or RAG_OPENAI_API_KEY or OPENAI_API_KEY or ""
+    model = os.getenv("EVAL_MODEL", "deepseek-chat")
+    return base, key, model
+
+
+def _build_source_context(chunks: list[dict]) -> str:
+    """把检索片段拼成 <source> 块，id 从 1 递增，对齐离线 eval 的 build_context_string。"""
+    parts = []
+    for i, chunk in enumerate(chunks, start=1):
+        text = chunk.get("text", "") or chunk.get("content", "")
+        src_name = chunk.get("source") or chunk.get("name") or ""
+        attrs = f' name="{src_name}"' if src_name else ""
+        parts.append(f'<source id="{i}"{attrs}>{text}</source>')
+    return "\n".join(parts)
+
+
+def _render_rag_prompt(question: str, chunks: list[dict]) -> str:
+    """渲染 RAG 模板：注入 context 与 query（对齐离线 eval 的 render_rag_prompt）。"""
+    context = _build_source_context(chunks)
+    template = RAG_TEMPLATE or ""
+    prompt = template.replace("{{CONTEXT}}", context).replace("[context]", context)
+    prompt = prompt.replace("{{QUERY}}", question).replace("[query]", question)
+    return prompt
+
+
+def _extract_json(text: str) -> dict:
+    """从 LLM 输出稳健抽取 JSON（容忍 markdown 围栏 / 前后缀）。"""
+    text = (text or "").strip()
+    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+    if fence:
+        text = fence.group(1).strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError(f"no JSON object in judge output: {text[:200]}")
+    return json.loads(text[start : end + 1])
+
+
+async def _faithfulness_chat(messages: list[dict], temperature: float = 0.0) -> str:
+    """调 DeepSeek（OpenAI 兼容协议）拿一段文本输出。"""
+    base, key, model = _faithfulness_api()
+    if not key:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No API key configured for faithfulness evaluation (set OPENAI_API_KEY or RAG_OPENAI_API_KEY)",
+        )
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post(
+            base + "/chat/completions",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"model": model, "messages": messages, "temperature": temperature, "stream": False},
+        )
+        if resp.status_code != 200:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"LLM call failed: HTTP {resp.status_code}")
+        data = resp.json()
+        return (data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+
+
+async def _generate_answer(question: str, chunks: list[dict]) -> str:
+    """给定问题 + 检索片段，用 RAG 模板生成答案（system=渲染后的模板, user=问题）。"""
+    return await _faithfulness_chat(
+        [
+            {"role": "system", "content": _render_rag_prompt(question, chunks)},
+            {"role": "user", "content": question},
+        ]
+    )
+
+
+async def _judge_faithfulness(question: str, answer: str, chunks: list[dict]) -> dict:
+    """LLM-as-judge 忠实度判定：返回 faithfulness / claims / supported / total / refusal。"""
+    if not answer.strip():
+        return {"faithfulness": 0.0, "claims": [], "supported": 0, "total": 0, "refusal": False}
+
+    context = _build_source_context(chunks)
+    messages = [
+        {"role": "system", "content": _JUDGE_SYSTEM},
+        {"role": "user", "content": _JUDGE_PROMPT.format(question=question, context=context, answer=answer)},
+    ]
+
+    data = None
+    last_err = None
+    for _ in range(2):
+        raw = await _faithfulness_chat(messages)
+        try:
+            data = _extract_json(raw)
+            break
+        except (ValueError, json.JSONDecodeError) as e:
+            last_err = e
+            messages.append({"role": "assistant", "content": raw})
+            messages.append({"role": "user", "content": "That was not valid JSON. Output ONLY the JSON object as requested."})
+    if data is None:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Judge returned invalid JSON: {last_err}")
+
+    claims = data.get("claims", [])
+    if not claims:
+        # 无主张（拒答 / 空输出）→ 视为忠实，没有编造
+        return {"faithfulness": 1.0, "claims": [], "supported": 0, "total": 0, "refusal": True}
+
+    supported = sum(1 for c in claims if c.get("supported") == "yes")
+    total = len(claims)
+    return {
+        "faithfulness": round(supported / total, 4),
+        "claims": claims,
+        "supported": supported,
+        "total": total,
+        "refusal": False,
+    }
+
+
+class KnowledgeFaithfulnessEvalForm(BaseModel):
+    query: Optional[str] = None
+    queries: Optional[List[str]] = None
+    k: int = 10
+
+
+@router.post('/{id}/evaluate/faithfulness')
+async def evaluate_faithfulness(
+    request: Request,
+    id: str,
+    form_data: KnowledgeFaithfulnessEvalForm,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """对一条或多条问题跑「真实检索 → 生成 → LLM-as-judge 忠实度判定」，返回逐条拆解 + 聚合分数。
+
+    这是离线评测体系（enterprise-kb/eval）的 full 档在线版，供前端可视化查看生成质量。
+    """
+    knowledge = await Knowledges.get_knowledge_by_id(id, db=db)
+    if not knowledge:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+
+    questions = list(form_data.queries or [])
+    if form_data.query:
+        questions.append(form_data.query)
+    questions = [q.strip() for q in questions if q and q.strip()]
+    if not questions:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="query or queries is required")
+
+    k = form_data.k if form_data.k else 10
+    _, _, model = _faithfulness_api()
+
+    results = []
+    for q in questions:
+        # 1) 真实混合检索 + 重排（与 evaluate/query 同一条生产链路）
+        try:
+            qr = await query_collection(
+                request=request,
+                collection_names=[id],
+                queries=[q],
+                embedding_function=request.app.state.EMBEDDING_FUNCTION,
+                k=k,
+                k_reranker=k,
+            )
+        except Exception as e:
+            log.exception(e)
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+        chunks = []
+        if isinstance(qr, dict) and qr.get("documents"):
+            docs = qr.get("documents", [[]])[0]
+            metas = qr.get("metadatas", [[]])[0] if qr.get("metadatas") else []
+            dists = qr.get("distances", [[]])[0] if qr.get("distances") else []
+            for i in range(min(k, len(docs))):
+                meta = metas[i] if i < len(metas) else {}
+                chunks.append({
+                    "text": docs[i],
+                    "source": meta.get("name") or meta.get("source") or meta.get("file_id", ""),
+                    "score": dists[i] if i < len(dists) else None,
+                    "rank": i + 1,
+                })
+
+        # 2) 生成答案（RAG 模板 + DeepSeek，temperature=0）
+        answer = await _generate_answer(q, chunks)
+
+        # 3) LLM-as-judge 忠实度判定
+        verdict = await _judge_faithfulness(q, answer, chunks)
+
+        results.append({
+            "query": q,
+            "answer": answer,
+            "faithfulness": verdict["faithfulness"],
+            "supported": verdict["supported"],
+            "total": verdict["total"],
+            "refusal": verdict["refusal"],
+            "claims": verdict["claims"],
+            "context_chunks": chunks,
+        })
+
+    scores = [r["faithfulness"] for r in results]
+    aggregate = round(sum(scores) / len(scores), 4) if scores else 0.0
+    return {
+        "mode": "full",
+        "model": model,
+        "aggregate_faithfulness": aggregate,
+        "threshold": float(os.getenv("EVAL_THRESHOLD", "0.8")),
+        "results": results,
+    }
 
 
 # ─────────────────────────────────────────────────────────────

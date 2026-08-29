@@ -665,6 +665,7 @@ async def query_collection(
     queries: list[str],
     embedding_function,
     k: int,
+    k_reranker: int | None = None,
 ) -> dict:
     config = await Config.get_many(
         'rag.enable_hybrid_search',
@@ -687,7 +688,7 @@ async def query_collection(
                 embedding_function=embedding_function,
                 k=k,
                 reranking_function=reranking_function,
-                k_reranker=config.get('rag.top_k_reranker'),
+                k_reranker=k_reranker if k_reranker is not None else config.get('rag.top_k_reranker'),
                 r=config.get('rag.relevance_threshold'),
                 hybrid_bm25_weight=config.get('rag.hybrid_bm25_weight'),
                 enable_enriched_texts=config.get('rag.enable_hybrid_search_enriched_texts'),

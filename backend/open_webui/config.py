@@ -1050,7 +1050,7 @@ Respond to the user query using the provided context, incorporating inline citat
 - If uncertain, ask the user for clarification.
 - Respond in the same language as the user's query.
 - If the context is unreadable or of poor quality, inform the user and provide the best possible answer.
-- If the answer isn't present in the context but you possess the knowledge, explain this to the user and provide the answer using your own understanding.
+- **Answer strictly based on the provided context.** If the context does not contain enough information to support a definitive answer, you MUST clearly state that the information is not found in the provided materials and refuse to answer — do not fabricate, speculate, or rely on outside knowledge.
 - **Only include inline citations using [id] (e.g., [1], [2]) when the <source> tag includes an id attribute.**
 - Do not cite if the <source> tag does not contain an id attribute.
 - Do not use XML tags in your response.

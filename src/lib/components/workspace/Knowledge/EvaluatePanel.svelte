@@ -98,6 +98,33 @@
 		}
 	}
 
+	// ── Compute metrics locally from results + annotations ──
+	// Mirrors the backend formulas (recall@K / precision@K / MRR) exactly, so
+	// annotating never needs to re-run the expensive retrieval query.
+	function computeMetrics(): Metrics | null {
+		const relevant = new Set(
+			Object.entries(annotations)
+				.filter(([, v]) => v === 1)
+				.map(([id]) => id)
+		);
+		if (relevant.size === 0) return null;
+		const retrieved = new Set(results.map(r => r.chunk_id).filter(Boolean));
+		let relevantRetrieved = 0;
+		for (const id of relevant) if (retrieved.has(id)) relevantRetrieved++;
+
+		let mrr = 0;
+		for (const r of results) {
+			if (annotations[r.chunk_id] === 1 && r.rank > 0) mrr = Math.max(mrr, 1 / r.rank);
+		}
+
+		return {
+			recall_at_k: Math.round((relevantRetrieved / relevant.size) * 10000) / 10000,
+			precision_at_k: Math.round((relevantRetrieved / k) * 10000) / 10000,
+			mrr: Math.round(mrr * 10000) / 10000,
+			total_relevant: relevant.size
+		};
+	}
+
 	// ── Toggle relevance annotation ──
 	async function toggleRelevance(chunkId: string, relevance: number) {
 		annotations[chunkId] = relevance;
@@ -106,7 +133,7 @@
 		annotating = true;
 		try {
 			const chunk = results.find(r => r.chunk_id === chunkId);
-			await fetch(`${WEBUI_API_BASE_URL}/knowledge/${knowledgeId}/evaluate/annotate`, {
+			const res = await fetch(`${WEBUI_API_BASE_URL}/knowledge/${knowledgeId}/evaluate/annotate`, {
 				method: 'POST',
 				headers: {
 					'Content-Type': 'application/json',
@@ -122,22 +149,10 @@
 					}]
 				})
 			});
-			// Reload metrics after annotating
-			const res = await fetch(
-				`${WEBUI_API_BASE_URL}/knowledge/${knowledgeId}/evaluate/query`,
-				{
-					method: 'POST',
-					headers: {
-						'Content-Type': 'application/json',
-						authorization: `Bearer ${$user?.token}`
-					},
-					body: JSON.stringify({ query: query.trim(), k })
-				}
-			);
-			if (res.ok) {
-				const data = await res.json();
-				metrics = data.metrics ?? null;
-			}
+			if (!res.ok) throw await res.json();
+			// Metrics recompute purely from local results + annotations — the top-K
+			// retrieval results don't change on annotation, so skip the re-query.
+			metrics = computeMetrics();
 		} catch (e: any) {
 			toast.error(e?.detail ?? 'Annotation failed');
 		} finally {
