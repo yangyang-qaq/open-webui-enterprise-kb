@@ -1356,6 +1356,12 @@ class KnowledgeEvaluateQueryForm(BaseModel):
     k: int = 10
 
 
+class KnowledgePromptForm(BaseModel):
+    """Form to update the KB-level RAG prompt template."""
+
+    prompt_template: str
+
+
 class KnowledgeSnapshotCompareForm(BaseModel):
     """Form to compare two snapshots."""
 

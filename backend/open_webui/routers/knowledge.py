@@ -46,6 +46,7 @@ from open_webui.models.knowledge import (
     KnowledgeProcessingTaskModel,
     KnowledgeBatchTask,
     KnowledgeBatchTaskModel,
+    KnowledgePromptForm,
     KnowledgeRelevanceAnnotationForm,
     KnowledgeResponse,
     KnowledgeRelevanceJudgment,
@@ -3431,6 +3432,45 @@ async def delete_evaluation_judgments(
     )
     await db.commit()
     return {'status': True}
+
+
+# ─────────────────────────────────────────────────────────────
+# Enterprise Knowledge Dashboard – Phase 6: KB-level RAG Prompt Template
+# ─────────────────────────────────────────────────────────────
+
+@router.get('/{id}/prompt')
+async def get_kb_prompt_template(
+    id: str,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """Get the KB-level RAG prompt template (custom or global default)."""
+    knowledge = await Knowledges.get_knowledge_by_id(id, db=db)
+    if not knowledge:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+
+    custom_tpl = (knowledge.meta or {}).get('rag_prompt_template')
+    if custom_tpl:
+        return {'prompt_template': custom_tpl, 'is_default': False}
+    return {'prompt_template': RAG_TEMPLATE, 'is_default': True}
+
+
+@router.patch('/{id}/prompt')
+async def update_kb_prompt_template(
+    id: str,
+    form_data: KnowledgePromptForm,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """Update the KB-level RAG prompt template (stored in knowledge.meta['rag_prompt_template'])."""
+    knowledge = await Knowledges.get_knowledge_by_id(id, db=db)
+    if not knowledge:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+
+    meta = knowledge.meta or {}
+    meta['rag_prompt_template'] = form_data.prompt_template
+    await Knowledges.update_knowledge_meta_by_id(id, meta, db=db)
+    return {'prompt_template': form_data.prompt_template, 'is_default': False}
 
 
 # ─────────────────────────────────────────────────────────────

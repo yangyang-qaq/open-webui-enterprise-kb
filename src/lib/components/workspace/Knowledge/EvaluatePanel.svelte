@@ -47,6 +47,50 @@
 	let metrics: Metrics | null = null;
 	let annotations: Record<string, number> = {}; // chunk_id → 0|1
 
+	// ── Prompt template ──
+	let promptTemplate = '';
+	let promptIsDefault = true;
+	let showPromptEditor = false;
+	let savingPrompt = false;
+
+	async function loadPrompt() {
+		try {
+			const res = await fetch(`${WEBUI_API_BASE_URL}/knowledge/${knowledgeId}/prompt`, {
+				headers: { authorization: `Bearer ${$user?.token}` }
+			});
+			if (res.ok) {
+				const data = await res.json();
+				promptTemplate = data.prompt_template;
+				promptIsDefault = data.is_default;
+			}
+		} catch (e) { /* ignore */ }
+	}
+
+	async function savePrompt() {
+		savingPrompt = true;
+		try {
+			const res = await fetch(`${WEBUI_API_BASE_URL}/knowledge/${knowledgeId}/prompt`, {
+				method: 'PATCH',
+				headers: {
+					'Content-Type': 'application/json',
+					authorization: `Bearer ${$user?.token}`
+				},
+				body: JSON.stringify({ prompt_template: promptTemplate })
+			});
+			if (!res.ok) throw await res.json();
+			promptIsDefault = false;
+			toast.success('Prompt template saved');
+		} catch (e: any) {
+			toast.error(e?.detail ?? 'Failed to save prompt');
+		} finally {
+			savingPrompt = false;
+		}
+	}
+
+	function resetPrompt() {
+		promptTemplate = 'You are a helpful AI assistant. Use the following reference materials to answer the user\'s question.\n\nReference Materials:\n{context}\n\nUser Question: {query}\n\nIf the reference materials do not contain relevant information, please say so honestly.';
+	}
+
 	// ── Run evaluation query ──
 	async function runQuery() {
 		if (!query.trim()) return;
@@ -172,6 +216,8 @@
 		if (val > 0.4) return 'text-amber-600';
 		return 'text-red-500';
 	}
+
+	onMount(() => loadPrompt());
 </script>
 
 <div class="flex flex-col h-full">
@@ -187,6 +233,46 @@
 		>
 			← Back to Files
 		</button>
+	</div>
+
+	<!-- Prompt Template Editor -->
+	<div class="border-b border-gray-200 dark:border-gray-700">
+		<button
+			on:click={() => showPromptEditor = !showPromptEditor}
+			class="w-full flex items-center justify-between px-4 py-2 text-sm font-medium text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-900 transition"
+		>
+			<span>RAG Prompt Template {promptIsDefault ? '(default)' : '(customized)'}</span>
+			<span class="text-xs">{showPromptEditor ? '▲' : '▼'}</span>
+		</button>
+		{#if showPromptEditor}
+			<div class="px-4 pb-3 space-y-2">
+				<div class="text-xs text-gray-400">
+					Variables: <code class="px-1 bg-gray-100 dark:bg-gray-700 rounded">{'{query}'}</code>
+					<code class="px-1 bg-gray-100 dark:bg-gray-700 rounded">{'{context}'}</code>
+					<code class="px-1 bg-gray-100 dark:bg-gray-700 rounded">{'{kb_name}'}</code>
+				</div>
+				<textarea
+					bind:value={promptTemplate}
+					rows="6"
+					class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2 text-sm font-mono"
+				></textarea>
+				<div class="flex gap-2">
+					<button
+						on:click={savePrompt}
+						disabled={savingPrompt}
+						class="px-3 py-1 text-xs rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
+					>
+						{savingPrompt ? 'Saving...' : 'Save'}
+					</button>
+					<button
+						on:click={resetPrompt}
+						class="px-3 py-1 text-xs rounded-lg bg-gray-100 hover:bg-gray-200 dark:bg-gray-700 dark:hover:bg-gray-600"
+					>
+						Reset to Default
+					</button>
+				</div>
+			</div>
+		{/if}
 	</div>
 
 	<!-- Query Input -->
