@@ -1,0 +1,34 @@
+name: RAG Faithfulness Eval
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  faithfulness:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: eval
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Run faithfulness eval (judge-only)
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_BASE_URL: https://api.deepseek.com/v1
+          EVAL_MODEL: deepseek-chat
+          EVAL_THRESHOLD: ${{ vars.EVAL_THRESHOLD || '0.8' }}
+        run: python run_eval.py --mode judge-only
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: faithfulness-report
+          path: eval/reports/

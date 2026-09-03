@@ -1,0 +1,30 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "GoldenSet",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "required": ["id", "question", "golden_answer"],
+    "properties": {
+      "id": { "type": "string", "description": "唯一标识，如 q001" },
+      "question": { "type": "string", "description": "用户查询问题" },
+      "golden_answer": { "type": "string", "description": "人工核实正确的参考答案" },
+      "kb_id": { "type": "string", "description": "知识库 id（full 档检索用；为空则用 EVAL_KB_ID）" },
+      "source_file": { "type": "string", "description": "答案来源文件（可选，便于溯源）" },
+      "context_chunks": {
+        "type": "array",
+        "description": "检索片段（judge-only 档直接使用；由 full 档 --save-context 回填）",
+        "items": {
+          "type": "object",
+          "required": ["text"],
+          "properties": {
+            "text": { "type": "string" },
+            "source": { "type": "string" },
+            "score": { "type": ["number", "null"] },
+            "rank": { "type": ["integer", "null"] }
+          }
+        }
+      }
+    }
+  }
+}

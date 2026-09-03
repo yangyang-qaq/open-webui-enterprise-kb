@@ -1,0 +1,39 @@
+name: RAG Faithfulness Eval (Full)
+
+on:
+  schedule:
+    # 每天 03:17 UTC（避开整点高峰）
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+jobs:
+  faithfulness-full:
+    # 需自托管 runner：后端在 127.0.0.1:8080 运行 + 混合检索/重排模型已加载
+    runs-on: [self-hosted]
+    defaults:
+      run:
+        working-directory: eval
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Run faithfulness eval (full)
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_BASE_URL: https://api.deepseek.com/v1
+          EVAL_MODEL: deepseek-chat
+          OWUI_BASE_URL: http://127.0.0.1:8080
+          EVAL_USER_EMAIL: ${{ secrets.EVAL_USER_EMAIL }}
+          EVAL_USER_PASSWORD: ${{ secrets.EVAL_USER_PASSWORD }}
+          EVAL_KB_ID: ${{ vars.EVAL_KB_ID }}
+          EVAL_THRESHOLD: ${{ vars.EVAL_THRESHOLD || '0.8' }}
+        run: python run_eval.py --mode full
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: faithfulness-report-full
+          path: eval/reports/

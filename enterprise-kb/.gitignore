@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+node_modules/
+.svelte-kit/
+
+# 压测生成物
+reports/
