@@ -1296,6 +1296,47 @@ async def del_workflow(wfid: str, user=Depends(get_verified_user), db: AsyncSess
     await db.execute(sa_delete(AgentWorkflow).where(AgentWorkflow.id == wfid, AgentWorkflow.user_id == user.id))
     await db.commit()
     return {"status": True}
+
+@router.post("/_agents/autonomous/exec")
+async def exec_autonomous_agent(
+    request: Request, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)
+):
+    """自主式 LangChain Agent：body {query, knowledge_id, max_steps}，SSE 流式返回每轮轨迹 + 最终结论。"""
+    from open_webui.utils.agent_autonomous import run_autonomous
+
+    b = await request.json()
+    query = (b.get("query") or "").strip()
+    knowledge_id = b.get("knowledge_id") or ""
+    max_steps = max(1, min(int(b.get("max_steps", 8) or 8), 15))
+    if not query or not knowledge_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="query and knowledge_id are required")
+
+    knowledge = await Knowledges.get_knowledge_by_id(id=knowledge_id, db=db)
+    if not knowledge:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+    # 可见性校验（镜像 get_knowledge_by_id：admin / owner / 被授权 read）
+    if not (
+        user.role == 'admin'
+        or knowledge.user_id == user.id
+        or await AccessGrants.has_access(
+            user_id=user.id, resource_type='knowledge', resource_id=knowledge_id, permission='read', db=db
+        )
+    ):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+
+    SSE = chr(10) + chr(10)
+
+    async def event_generator():
+        try:
+            async for ev in run_autonomous(request, knowledge_id, query, max_steps):
+                yield "data: " + json.dumps(ev) + SSE
+        except Exception as e:
+            yield "data: " + json.dumps({"type": "error", "message": str(e)[:300]}) + SSE
+            yield "data: " + json.dumps({"type": "done", "status": "error"}) + SSE
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
 @router.get('/{id}', response_model=KnowledgeFilesResponse | None)
 async def get_knowledge_by_id(id: str, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)):
     knowledge = await Knowledges.get_knowledge_by_id(id=id, db=db)

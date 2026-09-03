@@ -1,5 +1,5 @@
 <script lang="ts">
-	import AgentWorkflowEditor from '$lib/components/workspace/Knowledge/AgentWorkflowEditor.svelte';
+	import AgentsPanel from '$lib/components/workspace/Knowledge/AgentsPanel.svelte';
 </script>
 
-<AgentWorkflowEditor />
+<AgentsPanel />
