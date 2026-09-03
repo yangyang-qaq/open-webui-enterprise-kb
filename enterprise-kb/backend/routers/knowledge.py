@@ -46,6 +46,7 @@ from open_webui.models.knowledge import (
     KnowledgeProcessingTaskModel,
     KnowledgeBatchTask,
     KnowledgeBatchTaskModel,
+    KnowledgePromptForm,
     KnowledgeRelevanceAnnotationForm,
     KnowledgeResponse,
     KnowledgeRelevanceJudgment,
@@ -1295,6 +1296,47 @@ async def del_workflow(wfid: str, user=Depends(get_verified_user), db: AsyncSess
     await db.execute(sa_delete(AgentWorkflow).where(AgentWorkflow.id == wfid, AgentWorkflow.user_id == user.id))
     await db.commit()
     return {"status": True}
+
+@router.post("/_agents/autonomous/exec")
+async def exec_autonomous_agent(
+    request: Request, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)
+):
+    """自主式 LangChain Agent：body {query, knowledge_id, max_steps}，SSE 流式返回每轮轨迹 + 最终结论。"""
+    from open_webui.utils.agent_autonomous import run_autonomous
+
+    b = await request.json()
+    query = (b.get("query") or "").strip()
+    knowledge_id = b.get("knowledge_id") or ""
+    max_steps = max(1, min(int(b.get("max_steps", 8) or 8), 15))
+    if not query or not knowledge_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="query and knowledge_id are required")
+
+    knowledge = await Knowledges.get_knowledge_by_id(id=knowledge_id, db=db)
+    if not knowledge:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+    # 可见性校验（镜像 get_knowledge_by_id：admin / owner / 被授权 read）
+    if not (
+        user.role == 'admin'
+        or knowledge.user_id == user.id
+        or await AccessGrants.has_access(
+            user_id=user.id, resource_type='knowledge', resource_id=knowledge_id, permission='read', db=db
+        )
+    ):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+
+    SSE = chr(10) + chr(10)
+
+    async def event_generator():
+        try:
+            async for ev in run_autonomous(request, knowledge_id, query, max_steps):
+                yield "data: " + json.dumps(ev) + SSE
+        except Exception as e:
+            yield "data: " + json.dumps({"type": "error", "message": str(e)[:300]}) + SSE
+            yield "data: " + json.dumps({"type": "done", "status": "error"}) + SSE
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
 @router.get('/{id}', response_model=KnowledgeFilesResponse | None)
 async def get_knowledge_by_id(id: str, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)):
     knowledge = await Knowledges.get_knowledge_by_id(id=id, db=db)
@@ -2902,12 +2944,12 @@ async def merge_knowledge_chunks(
         updated_at=now,
     )
 
-    # Delete old chunks
+    # Delete old chunks (their indices become free at the SQL level)
     old_ids = [c.id for c in target_chunks]
     await db.execute(sa_delete(KnowledgeChunk).where(KnowledgeChunk.id.in_(old_ids)))
-    db.add(merged_chunk)
 
-    # Re-index chunks after the deleted range
+    # Fetch trailing chunks BEFORE adding merged_chunk: a pending INSERT would
+    # autoflush on this query.
     result = await db.execute(
         sa_select(KnowledgeChunk)
         .where(
@@ -2918,9 +2960,25 @@ async def merge_knowledge_chunks(
         .order_by(KnowledgeChunk.chunk_index.asc())
     )
     trailing = result.scalars().all()
+
+    # Same UNIQUE(file_id, chunk_index) trap as split: SQLite checks the
+    # constraint per statement, and with random-UUID primary keys the ORM flush
+    # order is not guaranteed, so a naive ripple (each chunk -= offset) collides
+    # with the next still-unmoved chunk (~50% failure in practice). Park every
+    # trailing chunk in a +10000 safe zone (targets unique/empty -> no UPDATE
+    # can collide), then subtract into the final slots, which are all free.
     offset = form_data.end_index - form_data.start_index
     for chunk in trailing:
-        chunk.chunk_index -= offset
+        chunk.chunk_index += 10000
+        chunk.updated_at = now
+    await db.flush()
+
+    # Insert the merged chunk at start_index (freed by the DELETE above)
+    db.add(merged_chunk)
+
+    # Renumber trailing chunks into their final (compacted) slots
+    for chunk in trailing:
+        chunk.chunk_index -= 10000 + offset
         chunk.updated_at = now
 
     await db.commit()
@@ -2971,7 +3029,8 @@ async def split_knowledge_chunk(
     chunk.content_hash = hashlib.sha256(part_a.encode()).hexdigest()
     chunk.updated_at = now
 
-    # Create new chunk for part_b
+    # Create new chunk for part_b (added only after trailing chunks are parked
+    # out of the way, so index k+1 is guaranteed free)
     new_chunk = KnowledgeChunk(
         id=str(uuid.uuid4()),
         knowledge_id=id,
@@ -2984,9 +3043,9 @@ async def split_knowledge_chunk(
         created_at=now,
         updated_at=now,
     )
-    db.add(new_chunk)
 
-    # Shift trailing chunks
+    # Fetch trailing chunks BEFORE adding new_chunk: a pending INSERT would
+    # otherwise autoflush on this query and collide with the still-occupied k+1.
     result = await db.execute(
         sa_select(KnowledgeChunk)
         .where(
@@ -2997,8 +3056,22 @@ async def split_knowledge_chunk(
         .order_by(KnowledgeChunk.chunk_index.asc())
     )
     trailing = result.scalars().all()
+
+    # SQLite checks UNIQUE(file_id, chunk_index) immediately, per statement. To
+    # insert part_b at k+1 the trailing slots k+1..k+n must first be vacated,
+    # but shifting each chunk up by one in place would transiently duplicate an
+    # occupied index. Solution (问题记录 #17): park every trailing chunk in a
+    # +10000 safe zone (all targets unique and empty -> no UPDATE can collide),
+    # then insert part_b at the freed k+1, then renumber them to k+2, k+3, ...
     for tc in trailing:
-        tc.chunk_index += 1
+        tc.chunk_index += 10000
+        tc.updated_at = now
+    await db.flush()  # k+1 .. k+n are now free
+
+    db.add(new_chunk)
+
+    for tc in trailing:
+        tc.chunk_index -= 9999  # back to original index + 1
         tc.updated_at = now
 
     await db.commit()
@@ -3266,12 +3339,15 @@ async def evaluate_retrieval_query(
     k = form_data.k if form_data.k else 10
 
     try:
+        # 评估走生产真实链路（混合检索 + Cross-Encoder 重排），但重排后返回完整 k 条
+        # （而非 top_k_reranker=3 截断），否则 recall@K/precision@K/MRR 会被截断失真。
         result = await query_collection(
             request=request,
             collection_names=[id],
             queries=[form_data.query],
             embedding_function=request.app.state.EMBEDDING_FUNCTION,
             k=k,
+            k_reranker=k,
         )
     except Exception as e:
         log.exception(e)
@@ -3428,6 +3504,45 @@ async def delete_evaluation_judgments(
     )
     await db.commit()
     return {'status': True}
+
+
+# ─────────────────────────────────────────────────────────────
+# Enterprise Knowledge Dashboard – Phase 6: KB-level RAG Prompt Template
+# ─────────────────────────────────────────────────────────────
+
+@router.get('/{id}/prompt')
+async def get_kb_prompt_template(
+    id: str,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """Get the KB-level RAG prompt template (custom or global default)."""
+    knowledge = await Knowledges.get_knowledge_by_id(id, db=db)
+    if not knowledge:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+
+    custom_tpl = (knowledge.meta or {}).get('rag_prompt_template')
+    if custom_tpl:
+        return {'prompt_template': custom_tpl, 'is_default': False}
+    return {'prompt_template': RAG_TEMPLATE, 'is_default': True}
+
+
+@router.patch('/{id}/prompt')
+async def update_kb_prompt_template(
+    id: str,
+    form_data: KnowledgePromptForm,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """Update the KB-level RAG prompt template (stored in knowledge.meta['rag_prompt_template'])."""
+    knowledge = await Knowledges.get_knowledge_by_id(id, db=db)
+    if not knowledge:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+
+    meta = knowledge.meta or {}
+    meta['rag_prompt_template'] = form_data.prompt_template
+    await Knowledges.update_knowledge_meta_by_id(id, meta, db=db)
+    return {'prompt_template': form_data.prompt_template, 'is_default': False}
 
 
 # ─────────────────────────────────────────────────────────────

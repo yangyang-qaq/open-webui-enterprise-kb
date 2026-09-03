@@ -7,6 +7,8 @@
 	import { WEBUI_API_BASE_URL } from '$lib/constants';
 	import Spinner from '$lib/components/common/Spinner.svelte';
 
+	export let embedded = false; // 由 AgentsPanel host 嵌入时隐藏自带头部
+
 	// Types
 	interface AgentRole { id: string; name: string; icon: string; default_prompt: string; }
 	interface WorkflowStep { order_index: number; agent_role: string; knowledge_id?: string; prompt_template?: string; input_var?: string; output_var?: string; }
@@ -136,18 +138,22 @@
 
 <div class="flex flex-col h-full">
 	<div class="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700">
-		<div>
-			<h1 class="text-xl font-semibold">Agent 工作流</h1>
-			<p class="text-sm text-gray-500 mt-1">多 Agent 协作编排</p>
-		</div>
-		<div class="flex gap-2">
+		{#if !embedded}
+			<div>
+				<h1 class="text-xl font-semibold">Agent 工作流</h1>
+				<p class="text-sm text-gray-500 mt-1">多 Agent 协作编排</p>
+			</div>
+		{/if}
+		<div class="flex gap-2 ml-auto">
 			<button on:click={() => { showEditor = true; wfName = ''; wfDesc = ''; wfSteps = [{ order_index: 0, agent_role: 'retriever', knowledge_id: knowledgeId, prompt_template: '', input_var: '', output_var: 'search_results' }]; }}
 				class="px-3 py-1.5 text-sm rounded-lg bg-blue-600 text-white hover:bg-blue-700">+ 创建工作流</button>
-			<button on:click={() => goto(`/workspace/knowledge/${knowledgeId}`)} class="text-sm text-gray-500 hover:text-gray-700">← 返回</button>
+			{#if !embedded}
+				<button on:click={() => goto(`/workspace/knowledge/${knowledgeId}`)} class="text-sm text-gray-500 hover:text-gray-700">← 返回</button>
+			{/if}
 		</div>
 	</div>
 
-	<div class="flex-1 overflow-auto p-4">
+		<div class="flex-1 overflow-auto p-4">
 		<!-- Workflow List -->
 		{#if workflows.length === 0 && loaded}
 			<div class="text-center py-20 text-gray-400">

@@ -2,7 +2,7 @@
 
 > 基于 [Open WebUI](https://github.com/open-webui/open-webui)（128K+ Stars）二次开发
 >
-> **全 8 个 Phase 已完成** | 33 个 API | 7 张数据表 | 7 种分块策略 | 5 种 Agent 角色 | 24 个技术问题已解决
+> **全 11 个 Phase 已完成** | 33+ 个 API | 7 张数据表 | 7 种分块策略 | 5 种 Agent 角色（编排式 + 自主式 LangChain Agent） | 32 个技术问题已解决
 
 ---
 
@@ -19,6 +19,7 @@
 | 📝 **Prompt 配置** | 模板编辑 / 变量替换 / 聊天管道注入 | Prompt Engineering 融入 RAG 管道 |
 | 🔪 **多策略分块** | 7 种算法 + jieba 关键词 + 问题生成 | 按文档类型自适应分块 |
 | 🤖 **Agent 工作流** | 多 Agent 协作 / 真实 LLM 调用 / Word 报告下载 | 检索→分析→汇报→校验，全链路可编排 |
+| ⚙️ **自主式 Agent** | LangGraph function-calling，5 角色即工具 | 模型自主决定调用顺序与轮数，与编排式一键切换，SSE 逐步轨迹 + 结论 |
 
 ---
 
@@ -96,6 +97,7 @@
 - SSE 流式执行反馈，步骤间变量传递
 - **检索增强**：k=15 检索 + 按文档分组排序合并（解决 chunk 碎片化）
 - **📥 Word 报告下载**：执行完成后一键下载 .docx 报告（含完整输出）
+- **⚙️ 自主式 LangChain Agent（最新）**：改用 `langchain.agents.create_agent`（LangGraph 栈）把 5 个角色做成工具，模型自主决定调用顺序/轮数（检索为空会自动换词重试）；`POST /knowledge/_agents/autonomous/exec` SSE 推送每轮 `round/observation` 轨迹与最终结论；前端 Agents Tab 右上角与编排式一键切换（`AgentsPanel` / `AutonomousAgentPanel`）
 
 ---
 
@@ -163,6 +165,11 @@
 | `POST` | `/_workflows/exec` | 执行工作流（SSE 流式返回） |
 | `POST` | `/_workflows/exec/download` | 下载 Word 执行报告 |
 | `DELETE` | `/_workflows/{wfid}` | 删除工作流 |
+
+### 自主式 Agent（新增）
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/_agents/autonomous/exec` | 自主式 LangChain Agent 执行（SSE 流式：round/observation/answer/done） |
 
 ---
 
