@@ -2903,12 +2903,12 @@ async def merge_knowledge_chunks(
         updated_at=now,
     )
 
-    # Delete old chunks
+    # Delete old chunks (their indices become free at the SQL level)
     old_ids = [c.id for c in target_chunks]
     await db.execute(sa_delete(KnowledgeChunk).where(KnowledgeChunk.id.in_(old_ids)))
-    db.add(merged_chunk)
 
-    # Re-index chunks after the deleted range
+    # Fetch trailing chunks BEFORE adding merged_chunk: a pending INSERT would
+    # autoflush on this query.
     result = await db.execute(
         sa_select(KnowledgeChunk)
         .where(
@@ -2919,9 +2919,25 @@ async def merge_knowledge_chunks(
         .order_by(KnowledgeChunk.chunk_index.asc())
     )
     trailing = result.scalars().all()
+
+    # Same UNIQUE(file_id, chunk_index) trap as split: SQLite checks the
+    # constraint per statement, and with random-UUID primary keys the ORM flush
+    # order is not guaranteed, so a naive ripple (each chunk -= offset) collides
+    # with the next still-unmoved chunk (~50% failure in practice). Park every
+    # trailing chunk in a +10000 safe zone (targets unique/empty -> no UPDATE
+    # can collide), then subtract into the final slots, which are all free.
     offset = form_data.end_index - form_data.start_index
     for chunk in trailing:
-        chunk.chunk_index -= offset
+        chunk.chunk_index += 10000
+        chunk.updated_at = now
+    await db.flush()
+
+    # Insert the merged chunk at start_index (freed by the DELETE above)
+    db.add(merged_chunk)
+
+    # Renumber trailing chunks into their final (compacted) slots
+    for chunk in trailing:
+        chunk.chunk_index -= 10000 + offset
         chunk.updated_at = now
 
     await db.commit()
@@ -2972,7 +2988,8 @@ async def split_knowledge_chunk(
     chunk.content_hash = hashlib.sha256(part_a.encode()).hexdigest()
     chunk.updated_at = now
 
-    # Create new chunk for part_b
+    # Create new chunk for part_b (added only after trailing chunks are parked
+    # out of the way, so index k+1 is guaranteed free)
     new_chunk = KnowledgeChunk(
         id=str(uuid.uuid4()),
         knowledge_id=id,
@@ -2985,9 +3002,9 @@ async def split_knowledge_chunk(
         created_at=now,
         updated_at=now,
     )
-    db.add(new_chunk)
 
-    # Shift trailing chunks
+    # Fetch trailing chunks BEFORE adding new_chunk: a pending INSERT would
+    # otherwise autoflush on this query and collide with the still-occupied k+1.
     result = await db.execute(
         sa_select(KnowledgeChunk)
         .where(
@@ -2998,8 +3015,22 @@ async def split_knowledge_chunk(
         .order_by(KnowledgeChunk.chunk_index.asc())
     )
     trailing = result.scalars().all()
+
+    # SQLite checks UNIQUE(file_id, chunk_index) immediately, per statement. To
+    # insert part_b at k+1 the trailing slots k+1..k+n must first be vacated,
+    # but shifting each chunk up by one in place would transiently duplicate an
+    # occupied index. Solution (问题记录 #17): park every trailing chunk in a
+    # +10000 safe zone (all targets unique and empty -> no UPDATE can collide),
+    # then insert part_b at the freed k+1, then renumber them to k+2, k+3, ...
     for tc in trailing:
-        tc.chunk_index += 1
+        tc.chunk_index += 10000
+        tc.updated_at = now
+    await db.flush()  # k+1 .. k+n are now free
+
+    db.add(new_chunk)
+
+    for tc in trailing:
+        tc.chunk_index -= 9999  # back to original index + 1
         tc.updated_at = now
 
     await db.commit()
