@@ -14,7 +14,8 @@
 		previewKnowledgeChunks,
 		mergeKnowledgeChunks,
 		splitKnowledgeChunk,
-		reindexKnowledgeChunks
+		reindexKnowledgeChunks,
+		aiRefineKnowledgeChunks
 	} from '$lib/apis/knowledge';
 
 	import Spinner from '$lib/components/common/Spinner.svelte';
@@ -24,6 +25,7 @@
 	let loaded = false;
 	let loading = false;
 	let reindexing = false;
+	let aiRefining = false;
 	let files: any[] = [];
 	let selectedFileId = '';
 	let chunkMethod = 'general';
@@ -97,6 +99,20 @@
 		finally { reindexing = false; }
 	};
 
+	const handleAIRefine = async () => {
+		if (!selectedFileId) return;
+		aiRefining = true;
+		try {
+			const result = await aiRefineKnowledgeChunks($user?.token ?? '', knowledgeId, selectedFileId);
+			await loadChunks(); // 刷新 Keywords/Questions 列
+			if ((result?.ai_fallback ?? 0) > 0)
+				toast.warning(`Refined ${result?.ai_ok ?? 0}/${result?.chunks_processed ?? 0}, ${result.ai_fallback} fell back to heuristic`);
+			else
+				toast.success(`AI Refine done: ${result?.ai_ok ?? result?.chunks_processed ?? 0} chunks`);
+		} catch (e: any) { toast.error(e?.detail ?? 'AI Refine failed'); }
+		finally { aiRefining = false; }
+	};
+
 	const toggleChunk = (chunkId: string) => {
 		if (selectedChunks.has(chunkId)) selectedChunks.delete(chunkId); else selectedChunks.add(chunkId);
 		selectedChunks = new Set(selectedChunks);
@@ -121,6 +137,9 @@
 			<button on:click={handleReindex} disabled={reindexing || chunks.length === 0} class="px-3 py-1.5 text-sm rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50">
 				{#if reindexing}<Spinner /> Reindexing...{:else}Reindex Vectors{/if}
 			</button>
+			<button on:click={handleAIRefine} disabled={aiRefining || !selectedFileId || chunks.length === 0} class="px-3 py-1.5 text-sm rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50">
+				{#if aiRefining}<Spinner /> Refining...{:else}AI Refine{/if}
+			</button>
 		</div>
 	</div>
 
@@ -144,6 +163,7 @@
 				<option value="resume">Resume</option>
 				<option value="table">Table</option>
 				<option value="qa">Q&A</option>
+				<option value="auto">Auto</option>
 			</select>
 		</div>
 	</div>

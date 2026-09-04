@@ -1962,6 +1962,18 @@ async def remove_file_from_knowledge_by_id(
         log.debug(e)
         pass
 
+    # Enterprise KB: drop this file's knowledge_chunk rows too. chunks/reindex
+    # rebuilds vectors from knowledge_chunk by knowledge_id alone, so without
+    # this cleanup a removed file's stale chunks would be re-embedded.
+    from sqlalchemy import delete as sa_delete
+
+    await db.execute(
+        sa_delete(KnowledgeChunk).where(
+            KnowledgeChunk.knowledge_id == id,
+            KnowledgeChunk.file_id == form_data.file_id,
+        )
+    )
+
     # Anyone with write permission or higher can delete files
     if delete_file and (file.user_id == user.id or user.role == 'admin'):
         try:
@@ -2724,6 +2736,26 @@ async def preview_knowledge_chunks(
     try:
         file_path = await asyncio.to_thread(Storage.get_file, file_path)
 
+        # Enterprise KB Phase 12: pre-read AI-refined chunks (content_hash → ai meta)
+        # BEFORE either delete below. Preview rebuilds meta heuristically, so an
+        # unchanged chunk that was AI-refined keeps its AI keywords/questions instead
+        # of being clobbered. Content whose hash changed (or that never had AI meta)
+        # misses the map and naturally falls back to the heuristics.
+        from sqlalchemy import select as sa_select
+        _old_rows = (
+            await db.execute(
+                sa_select(KnowledgeChunk).where(
+                    KnowledgeChunk.knowledge_id == id,
+                    KnowledgeChunk.file_id == form_data.file_id,
+                )
+            )
+        ).scalars().all()
+        ai_meta = {}
+        for _r in _old_rows:
+            _m = _r.meta or {}
+            if _m.get('ai') and _r.content_hash and _m.get('keywords') is not None and _m.get('questions') is not None:
+                ai_meta[_r.content_hash] = {'keywords': _m['keywords'], 'questions': _m['questions']}
+
         loader_config = await get_loader_config()
         loader = build_loader_from_config(request, loader_config)
         loader.user = user
@@ -2748,10 +2780,14 @@ async def preview_knowledge_chunks(
                 now = int(time.time())
                 chunks = []
                 for idx, rc in enumerate(raw):
-                    kw = extract_keywords(rc['content'])
-                    qs = generate_questions(rc['content'])
                     h = hashlib.sha256(rc['content'].encode()).hexdigest()
-                    ck = KnowledgeChunk(id=str(uuid.uuid4()), knowledge_id=id, file_id=form_data.file_id, chunk_index=idx, content=rc['content'], token_count=len(rc['content']) // 4, content_hash=h, meta={**rc.get('metadata', {}), 'keywords': kw, 'questions': qs}, created_at=now, updated_at=now)
+                    saved = ai_meta.get(h)
+                    meta = {**rc.get('metadata', {})}
+                    if saved is not None:
+                        meta.update({'keywords': saved['keywords'], 'questions': saved['questions'], 'ai': True})
+                    else:
+                        meta.update({'keywords': extract_keywords(rc['content']), 'questions': generate_questions(rc['content'])})
+                    ck = KnowledgeChunk(id=str(uuid.uuid4()), knowledge_id=id, file_id=form_data.file_id, chunk_index=idx, content=rc['content'], token_count=len(rc['content']) // 4, content_hash=h, meta=meta, created_at=now, updated_at=now)
                     db.add(ck)
                     chunks.append(KnowledgeChunkModel.model_validate(ck))
                 await db.commit()
@@ -2826,6 +2862,13 @@ async def preview_knowledge_chunks(
             content_hash = hashlib.sha256(doc.page_content.encode()).hexdigest()
             token_count = len(doc.page_content) // 4  # rough estimate
 
+            meta = {**doc.metadata}
+            saved = ai_meta.get(content_hash)
+            if saved is not None:
+                meta.update({'keywords': saved['keywords'], 'questions': saved['questions'], 'ai': True})
+            else:
+                meta.update({'keywords': extract_keywords(doc.page_content), 'questions': generate_questions(doc.page_content)})
+
             chunk = KnowledgeChunk(
                 id=str(uuid.uuid4()),
                 knowledge_id=id,
@@ -2833,7 +2876,7 @@ async def preview_knowledge_chunks(
                 chunk_index=idx,
                 content=doc.page_content,
                 token_count=token_count,
-                meta={**doc.metadata, 'keywords': extract_keywords(doc.page_content), 'questions': generate_questions(doc.page_content)},
+                meta=meta,
                 content_hash=content_hash,
                 created_at=now,
                 updated_at=now,
@@ -4044,5 +4087,166 @@ async def delete_knowledge_snapshot(
     )
     await db.commit()
     return {'status': True}
+
+
+# Enterprise Knowledge Dashboard – Phase 12: AI Refine (LLM keywords/questions)
+# =============================================================================
+# 手动「AI 提炼」：对当前文件的全部分块逐个调 LLM（OpenAI 兼容协议，默认
+# DeepSeek）生成贴合原文的关键词/问题并写回 knowledge_chunk.meta（带 ai=True
+# 标记）。单块 JSON 不合法时带纠错提示重试一次；两轮失败不回滚，落到启发式
+# （ai=False），避免把整批请求变成全部失败。并发上限由 asyncio.Semaphore(4)
+# 控制，所有调用共用一个 AsyncClient，完成后一次 commit。
+
+_AI_REFINE_SYSTEM = (
+    "You are an expert at indexing documents for retrieval. "
+    'Given one text chunk, output ONLY a valid JSON object, no markdown fences, '
+    'with exactly two keys: "keywords" (an array of 3-6 concise retrieval '
+    'keywords or key phrases, in the same language as the chunk) and '
+    '"questions" (an array of 3 likely user questions that this chunk alone can '
+    'answer).'
+)
+
+_AI_REFINE_MAX_CHARS = 6000
+
+
+def _build_ai_refine_prompt(content: str) -> str:
+    """把单块内容截断到上限后包进 user prompt，超长标注截断。"""
+    text = content[: _AI_REFINE_MAX_CHARS]
+    if len(content) > _AI_REFINE_MAX_CHARS:
+        text += "\n[content truncated]"
+    return f"Text chunk:\n{text}"
+
+
+async def _ai_refine_one(
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+    base_url: str,
+    api_key: str,
+    model: str,
+    content: str,
+) -> tuple[bool, list[str], list[str]]:
+    """单块 LLM 提炼。JSON 不合法时带纠错提示重试一次；两轮失败返回 (False, [], [])，
+    永不向上抛异常（保证 asyncio.gather 稳定）。"""
+    messages = [
+        {"role": "system", "content": _AI_REFINE_SYSTEM},
+        {"role": "user", "content": _build_ai_refine_prompt(content or "")},
+    ]
+    for attempt in range(2):
+        raw = ""
+        async with semaphore:
+            try:
+                resp = await client.post(
+                    base_url + "/chat/completions",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    json={
+                        "model": model,
+                        "messages": messages,
+                        "temperature": 0.0,
+                        "max_tokens": 512,
+                        "stream": False,
+                    },
+                )
+                if resp.status_code == 200:
+                    raw = (resp.json().get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+            except Exception:
+                raw = ""
+        if raw:
+            try:
+                data = _extract_json(raw)
+                kw = [str(x).strip() for x in data.get("keywords", []) if str(x).strip()][:8]
+                qs = [str(x).strip() for x in data.get("questions", []) if str(x).strip()][:8]
+                if kw or qs:
+                    return (True, kw, qs)
+            except (ValueError, json.JSONDecodeError):
+                pass
+        if attempt == 0:
+            messages.append({"role": "assistant", "content": raw})
+            messages.append(
+                {"role": "user", "content": 'That was not valid JSON. Output ONLY {"keywords": [...], "questions": [...]}.'}
+            )
+        else:
+            return (False, [], [])
+    return (False, [], [])
+
+
+@router.post('/{id}/chunks/ai-refine')
+async def ai_refine_knowledge_chunks(
+    id: str,
+    form_data: KnowledgeFileIdForm,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """对指定 (knowledge, file) 的全部分块调 LLM 生成关键词/问题，写回 meta。
+
+    统计口径：ai_ok=LLM 成功写入；ai_preserved=LLM 失败但旧值已是 AI，保留不动
+    （临时网络故障不清掉好结果）；ai_fallback=LLM 失败且旧值非 AI，回落启发式。
+    """
+    knowledge = await Knowledges.get_knowledge_by_id(id, db=db)
+    if not knowledge:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+
+    base_url, api_key, model = _faithfulness_api()
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No LLM API key configured for AI Refine (set OPENAI_API_KEY or RAG_OPENAI_API_KEY)",
+        )
+
+    from sqlalchemy import select as sa_select
+    from open_webui.utils.chunking_strategies import extract_keywords, generate_questions
+
+    result = await db.execute(
+        sa_select(KnowledgeChunk)
+        .where(KnowledgeChunk.knowledge_id == id, KnowledgeChunk.file_id == form_data.file_id)
+        .order_by(KnowledgeChunk.chunk_index.asc())
+    )
+    chunks = result.scalars().all()
+    if not chunks:
+        return {
+            'status': True,
+            'chunks_processed': 0,
+            'ai_ok': 0,
+            'ai_preserved': 0,
+            'ai_fallback': 0,
+            'message': 'No chunks to refine. Generate a preview first.',
+        }
+
+    sem = asyncio.Semaphore(4)
+    async with httpx.AsyncClient(timeout=120) as client:
+        outcomes = await asyncio.gather(
+            *(_ai_refine_one(client, sem, base_url, api_key, model, c.content) for c in chunks)
+        )
+
+    ai_ok = ai_preserved = ai_fallback = 0
+    now = int(time.time())
+    for chunk, (ok, kw, qs) in zip(chunks, outcomes):
+        meta = dict(chunk.meta or {})
+        if ok:
+            meta.update({'keywords': kw, 'questions': qs, 'ai': True})
+            ai_ok += 1
+        elif meta.get('ai'):
+            ai_preserved += 1  # 旧值已是 AI → 保留不动
+        else:
+            meta.update(
+                {
+                    'keywords': extract_keywords(chunk.content),
+                    'questions': generate_questions(chunk.content),
+                    'ai': False,
+                }
+            )
+            ai_fallback += 1
+        chunk.meta = meta
+        chunk.updated_at = now
+
+    await db.commit()
+
+    return {
+        'status': True,
+        'chunks_processed': len(chunks),
+        'ai_ok': ai_ok,
+        'ai_preserved': ai_preserved,
+        'ai_fallback': ai_fallback,
+        'message': f'AI Refine done: {ai_ok} ok, {ai_preserved} preserved, {ai_fallback} heuristic.',
+    }
 
 

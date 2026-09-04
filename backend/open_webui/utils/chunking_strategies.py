@@ -1,6 +1,6 @@
 """
 Multi-strategy document chunking for RAG knowledge bases.
-Adapted from reference RAG-Chunking project. Provides 7 chunking methods
+Adapted from reference RAG-Chunking project. Provides 8 chunking methods
 plus keyword extraction and question generation.
 """
 
@@ -20,6 +20,7 @@ CHUNKING_METHODS = {
     'resume': 'Resume (Module Recognition)',
     'table': 'Table (CSV/Markdown->KV)',
     'qa': 'Q&A Pair Recognition',
+    'auto': 'Auto (Content-Routing + Genre)',
 }
 
 
@@ -34,72 +35,285 @@ def chunk_document(content: str, method: str, params: dict | None = None):
         'resume': resume_chunking,
         'table': table_chunking,
         'qa': qa_chunking,
+        'auto': auto_chunking,
     }
     fn = methods.get(method, general_chunking)
     return fn(content, params)
 
 
+# Chinese "container / discourse" words (方法/问题/内容…) that raw frequency
+# ranking on one short chunk over-weights even though they carry little topical
+# signal. Dropping them pushes the focus onto the real subject words.
+KEYWORD_STOPWORDS = {
+    '一个', '一种', '这个', '那个', '这些', '那些', '这样', '那样', '其中', '然后',
+    '就是', '还是', '什么', '主要', '没有', '进行', '以及', '还有', '如果', '因为',
+    '所以', '但是', '已经', '通过', '使用', '可以', '内容', '方式', '方法', '问题',
+    '情况', '方面', '部分', '里面', '时候', '东西', '当前', '目前', '整个', '相关',
+    '一定', '重要', '非常', '比较', '由于', '比如', '例如', '需要', '可能', '应该',
+    '对于', '关于', '来说', '是否', '之间', '以上', '以下', '同时', '其实', '容易',
+    '等等', '我们', '他们', '你们', '自己', '一个', '一些', '这种', '那段', '这段',
+    '本', '中', '上', '下', '内', '外', '后', '前', '和', '与', '或', '并', '及',
+    '的', '了', '在', '是', '为', '等',
+}
+
+# Small English stop list: lets code tokens / acronyms (RAG, file_id) survive
+# as keywords while function words in English prose do not.
+_EN_STOPWORDS = {
+    'the', 'and', 'for', 'with', 'from', 'this', 'that', 'these', 'those',
+    'are', 'was', 'were', 'you', 'your', 'not', 'can', 'have', 'has', 'had',
+    'into', 'use', 'uses', 'using', 'used', 'after', 'before', 'over',
+    'under', 'about', 'between', 'which', 'where', 'when', 'what', 'how',
+    'why', 'its', 'their', 'then', 'also', 'will', 'would', 'could', 'should',
+    'may', 'might', 'each', 'both', 'one', 'two', 'all', 'any', 'per', 'who',
+    'whom', 'whose', 'does', 'did', 'of', 'to', 'in', 'on', 'at', 'as', 'or',
+    'a', 'an', 'it', 'by',
+}
+
+# Latin / code-ish tokens (RAG, ChromaDB, file_id, Top-K) are high-signal in a
+# Chinese dev-knowledge base, so pull them out before Chinese word ranking.
+_LATIN_TOKEN_RE = re.compile(r'[A-Za-z][A-Za-z0-9_\-]*(?:\.[A-Za-z0-9_\-]+)*')
+
+
 def extract_keywords(text: str, topK: int = 5) -> list[str]:
-    if not text:
+    """Rank a chunk's topical terms with no corpus available.
+
+    Two signal streams are merged:
+      1. Latin / code-ish tokens (RAG, ChromaDB, file_id, Top-K) — concrete
+         and unambiguous in a Chinese dev-knowledge base.
+      2. Chinese content words via jieba TextRank restricted to noun/verb POS.
+         (jieba's default TF-IDF needs a document collection and over-weights
+         frequent fluff on a single short text, so it is used only as a
+         fallback when TextRank yields nothing.)
+    """
+    if not text or not text.strip():
         return []
-    try:
-        if JIEBA_AVAILABLE:
-            if len(text) > 5000:
-                text = text[:5000]
-            return jieba.analyse.extract_tags(text, topK=topK, withWeight=False) or []
-    except Exception:
-        pass
-    try:
+
+    latin = []
+    for tok in _LATIN_TOKEN_RE.findall(text):
+        t = tok.strip('._-')
+        if len(t) < 2 or t.lower() in _EN_STOPWORDS:
+            continue
+        latin.append(t)
+    if latin:
+
+        def _strength(t: str) -> tuple:
+            # Identifiers / versions / proper-case terms rank before plain
+            # prose words; ties broken by frequency then alphabetically.
+            return (
+                -(2 if re.search(r'[_\-0-9]', t) else 0)
+                - (1 if re.search(r'[A-Z]', t) else 0)
+                - (1 if len(t) >= 5 else 0),
+                -latin.count(t),
+                t,
+            )
+
+        latin = sorted(set(latin), key=_strength)
+
+    chinese: list[str] = []
+    if JIEBA_AVAILABLE:
+        sample = text[:8000]
+        words = []
+        try:
+            words = jieba.analyse.textrank(
+                sample,
+                topK=topK * 3,
+                withWeight=False,
+                allowPOS=('n', 'nz', 'vn', 'v', 'nt', 'ns', 'nr'),
+            ) or []
+        except Exception:
+            words = []
+        if not words:
+            try:
+                words = jieba.analyse.extract_tags(sample[:5000], topK=topK * 3) or []
+            except Exception:
+                words = []
+        chinese = [w for w in words if len(w) >= 2 and w not in KEYWORD_STOPWORDS]
+    if not chinese:
         # Regex fallback when jieba is unavailable: rank 2-4 char Chinese
         # n-grams by frequency instead of treating whole clauses as "words".
-        stopwords = {'一个', '这个', '可以', '进行', '以及', '还有', '其中', '然后',
-                     '就是', '这样', '什么', '主要', '没有', '我们', '你们', '他们',
-                     '如果', '因为', '所以', '但是', '已经', '通过', '使用'}
-        words = re.findall(r'[一-龥]+', text)
-        word_freq = {}
-        for run in words:
+        word_freq: dict[str, int] = {}
+        for run in re.findall(r'[一-龥]+', text):
             for size in (2, 3, 4):
                 for i in range(len(run) - size + 1):
                     gram = run[i:i + size]
-                    if gram in stopwords:
+                    if gram in KEYWORD_STOPWORDS:
                         continue
                     word_freq[gram] = word_freq.get(gram, 0) + 1
-        if not word_freq:
-            return []
         ranked = sorted(word_freq.items(), key=lambda x: (x[1], len(x[0])), reverse=True)
-        return [w for w, _ in ranked[:topK]]
-    except Exception:
-        return []
+        chinese = [w for w, _ in ranked[: topK * 3]]
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for w in latin + chinese:
+        if w in seen:
+            continue
+        seen.add(w)
+        out.append(w)
+        if len(out) >= topK:
+            break
+    return out
+
+
+def _split_sentences(text: str) -> list[str]:
+    # Sentence enders are CJK stops, plus English full stops followed by
+    # whitespace or a CJK char. Dots inside versions/code (v0.10.2, file.py)
+    # are not boundaries because they are not followed by whitespace/CJK.
+    parts = re.split(r'(?<=[。！？；!?])\s*|[.!?](?=\s|[一-龥])|[\r\n]+', text)
+    return [p.strip() for p in parts if p and p.strip()]
+
+
+def _pick_question(topic: str, frames: list[str], used: set[str]) -> str | None:
+    t = f'「{topic}」'
+    for f in frames:
+        q = f.format(t=t)
+        if q not in used:
+            return q
+    return None
+
+
+# "用 X 来 做…" / "用 X 做…" instrumental sentences deserve a precise question
+# about the tool X (e.g. 「ChromaDB」是用来做什么的？) instead of a generic one.
+_INSTRUMENT_RE = re.compile(
+    r'用\s*([^，。！？；、\s“”「」]{2,20}?)(?:\s*(?:来|去))?\s*'
+    r'(存|放|记|写|读|查|取|做|构建|实现|查询|检索|展示|生成|管理|提取|拼接|记录|训练)'
+)
+
+
+def _instrument_question(sentence: str) -> tuple[str, str] | None:
+    m = _INSTRUMENT_RE.search(sentence)
+    if not m:
+        return None
+    tool = m.group(1).strip('的_')
+    if not tool:
+        return None
+    return tool, f'「{tool}」是用来做什么的？'
+
+
+# (cue regexes, frame pool) pairs — a definition/role/comparison frame is only
+# chosen when one of its cues appears in the SAME sentence, so the question is
+# approximately answerable from that sentence instead of being glued on at
+# random. The `None` entry is the generic fallback used when no cue matched.
+_QUESTION_CUES = (
+    ((r'如何', r'怎么', r'怎样', r'通过.{0,12}(实现|完成|做到)', r'步骤'),
+     ('{t}具体是如何实现的？', '实现{t}一般要分哪些步骤？')),
+    ((r'因为', r'由于', r'之所以', r'原因在于', r'是为了', r'为了', r'目的是', r'为什么'),
+     ('{t}是为了解决什么问题？', '为什么要用到{t}？')),
+    ((r'作用是', r'用于', r'用来', r'承担', r'负责', r'起到', r'充当'),
+     ('{t}起到什么作用？', '{t}主要用来做什么？')),
+    ((r'包括', r'分为', r'包含', r'构成', r'由.{0,10}组成'),
+     ('{t}包含哪些内容？', '{t}由哪几部分组成？')),
+    ((r'相比', r'对比', r'比较', r'优于', r'强于', r'区别于', r'不同于', r'差异', r'区别'),
+     ('{t}与常见做法有什么不同？', '{t}的优势体现在哪里？')),
+    ((r'特点', r'特性', r'优势', r'亮点', r'具备', r'支持', r'能够'),
+     ('{t}有哪些特点？', '{t}支持哪些能力？')),
+    ((r'是指', r'指的是', r'称之为', r'称为', r'叫做', r'定义为', r'简称', r'^.{0,16}是'),
+     ('什么是{t}？', '{t}具体指什么？')),
+    (None, ('关于{t}，这段内容讲了什么？', '{t}具体是什么情况？')),
+)
+
+# Deterministic last-resort summary bank (also reachable from the exception
+# path, so even an error never emits the identical filler three times).
+_SUMMARY_QUESTIONS = (
+    '这段内容主要介绍了什么？',
+    '这段内容想说明的核心观点是什么？',
+    '阅读这段内容后可以提炼出哪些要点？',
+)
 
 
 def generate_questions(text: str, count: int = 3) -> list[str]:
+    """Deterministic, content-anchored sample questions (no LLM).
+
+    Per sentence: the topic is the chunk's own strongest keyword that appears
+    in that sentence, and the interrogative frame is picked by a cue that also
+    appears in the sentence (how / why / role / composition / compare /
+    feature / definition). This keeps questions related to the actual text
+    instead of glueing an arbitrary word into one of two fixed templates, and
+    varied frames avoid the old "three copies of the same generic sentence".
+    """
     try:
-        questions = []
-        if len(text) > 2000:
-            text = text[:2000]
-        sentences = re.split(r'[。！？.!?]', text)
-        sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
-        for sentence in sentences[:count]:
-            # Pick a concrete topic (keyword) so the question stays grammatical;
-            # never splice a truncated sentence into a template.
-            topic = None
-            try:
-                topic = (extract_keywords(sentence, topK=1) or [None])[0]
-            except Exception:
-                topic = None
-            if not topic:
+        if len(text) > 3000:
+            text = text[:3000]
+        sentences = _split_sentences(text)
+        keywords = extract_keywords(text, topK=min(8, max(count * 2, 4)))
+        candidates = [
+            s for s in sentences
+            if len(s) >= 8
+            and (
+                len(re.findall(r'[一-龥]', s)) >= 4
+                or bool(re.search(r'[A-Za-z][A-Za-z0-9_\-]{2,}', s))
+            )
+        ]
+
+        questions: list[str] = []
+        used: set[str] = set()
+        used_topics: set[str] = set()
+        for sentence in candidates:
+            if len(questions) >= count:
+                break
+            topic = next((k for k in keywords if k in sentence), None)
+            # Prefer a specific cue-matched frame (定义/作用/组成/对比…);
+            # otherwise an instrument question ("用 X 来做…"); only then the
+            # generic "关于 X，这段内容讲了什么" frame.
+            specific = None
+            for cues, pool in _QUESTION_CUES:
+                if cues is None:
+                    break
+                if any(re.search(c, sentence) for c in cues):
+                    specific = pool
+                    break
+            q = None
+            qtopic = None
+            if topic and specific:
+                q = _pick_question(topic, specific, used)
+                qtopic = topic
+            if q is None:
+                inst = _instrument_question(sentence)
+                if inst and inst[0] not in used_topics and inst[1] not in used:
+                    qtopic, q = inst
+            if q is None and topic:
+                q = _pick_question(topic, _QUESTION_CUES[-1][1], used)
+                qtopic = topic
+            if q:
+                used.add(q)
+                if qtopic:
+                    used_topics.add(qtopic)
+                questions.append(q)
+
+        # Spread: if more sentences produced questions than needed, keep an
+        # even sample across the text instead of only the head.
+        if len(questions) > count:
+            span = len(questions) - 1
+            step = max(count - 1, 1)
+            questions = [questions[min(int(i * span / step), len(questions) - 1)] for i in range(count)]
+
+        # Top up with keyword-anchored frames, so filler never is the same
+        # sentence three times, still points at real content, and never repeats
+        # a topic that already produced a real question.
+        for kw in keywords:
+            if len(questions) >= count:
+                break
+            if kw in used_topics:
                 continue
-            if '如何' in sentence or '怎么' in sentence:
-                questions.append(f"「{topic}」具体是如何实现的？")
-            elif '是' in sentence or '为' in sentence:
-                questions.append(f"「{topic}」指的是什么？")
-            else:
-                questions.append(f"关于「{topic}」，这段内容说了什么？")
+            q = _pick_question(kw, _QUESTION_CUES[-1][1], used)
+            if q:
+                used.add(q)
+                used_topics.add(kw)
+                questions.append(q)
+
+        # Last resort: short, distinct summary questions.
+        n = 1
         while len(questions) < count:
-            questions.append("这段内容的主要观点是什么？")
+            if n <= len(_SUMMARY_QUESTIONS):
+                q = _SUMMARY_QUESTIONS[n - 1]
+            else:
+                q = f'这段内容还能提炼出第{n - len(_SUMMARY_QUESTIONS)}个要点是什么？'
+            n += 1
+            if q not in used:
+                used.add(q)
+                questions.append(q)
         return questions[:count]
     except Exception:
-        return ["这段内容的主要观点是什么？"] * count
+        return [_SUMMARY_QUESTIONS[i % len(_SUMMARY_QUESTIONS)] for i in range(count)]
 
 
 # ── Naive ──
@@ -187,6 +401,12 @@ def general_chunking(content: str, params: dict) -> list[dict]:
 
 # ── Book (chapter recognition) ──
 
+BOOK_CHAPTER_PATTERN = re.compile(
+    r'^(?:第\s*[一二三四五六七八九十百千0-9]+\s*[章节部篇]|Chapter\s+\d+|CHAPTER\s+\d+)',
+    re.IGNORECASE,
+)
+
+
 def book_chunking(content: str, params: dict) -> list[dict]:
     chunks = []
     lines = content.split('\n')
@@ -195,10 +415,6 @@ def book_chunking(content: str, params: dict) -> list[dict]:
     # Only real chapter markers open a new chunk. Treating any short
     # non-punctuation line as a heading used to fragment ordinary prose into
     # one-line "chapters" (and then silently fall back to general).
-    chapter_pattern = re.compile(
-        r'^(?:第\s*[一二三四五六七八九十百千0-9]+\s*[章节部篇]|Chapter\s+\d+|CHAPTER\s+\d+)',
-        re.IGNORECASE,
-    )
     max_size = params.get('chunk_size', 3000)
     flush_threshold = params.get('min_chunk_length', 20)
     chapter_found = False
@@ -206,7 +422,7 @@ def book_chunking(content: str, params: dict) -> list[dict]:
         line = line.strip()
         if not line:
             continue
-        if chapter_pattern.match(line):
+        if BOOK_CHAPTER_PATTERN.match(line):
             chapter_found = True
             if current_section:
                 chunks.append({'content': '\n'.join(current_section), 'metadata': {'method': 'book', 'title': current_chapter or '未命名章节'}})
@@ -414,9 +630,11 @@ def _convert_md_table(header_line, data_rows, title=None):
 
 # ── QA Pairs ──
 
+QA_PATTERN = r'(?:问题?[:：]|Q[:：])\s*(.+?)\s*(?:答案?[:：]|A[:：])\s*(.+?)(?=(?:问题?[:：]|Q[:：])|$)'
+
+
 def qa_chunking(content: str, params: dict) -> list[dict]:
-    qa_pattern = r'(?:问题?[:：]|Q[:：])\s*(.+?)\s*(?:答案?[:：]|A[:：])\s*(.+?)(?=(?:问题?[:：]|Q[:：])|$)'
-    matches = re.findall(qa_pattern, content, re.DOTALL | re.IGNORECASE)
+    matches = re.findall(QA_PATTERN, content, re.DOTALL | re.IGNORECASE)
     chunks = []
     for question, answer in matches:
         chunks.append({
@@ -424,3 +642,188 @@ def qa_chunking(content: str, params: dict) -> list[dict]:
             'metadata': {'method': 'qa', 'question': question.strip(), 'answer': answer.strip()}
         })
     return chunks if chunks else general_chunking(content, params)
+
+
+# ── Auto (content-routing + whole-document genre pre-detection) ──
+
+# 'auto' splits one document into ordered, verbatim runs (markdown table /
+# CSV table / Q&A / prose) and routes each run to the strategy that
+# understands it: tables go to the table helpers, Q&A goes to qa_chunking,
+# prose goes to whichever of book/paper/resume/general best fits the whole
+# document's genre (book chapters > paper sections > resume modules > none).
+#
+# Invariants:
+#   * Every run is routed as its ORIGINAL character slice (never re-serialized
+#     and never merged across runs), so a single-type document fed to 'auto'
+#     is chunked exactly as if that type's own strategy had been chosen —
+#     the tests assert that equality per chunk.
+#   * Classification is deliberately conservative: anything ambiguous stays
+#     prose, and any run whose handler returns nothing falls back to
+#     general_chunking — content is never dropped.
+#   * Each chunk's metadata['method'] records the *inner* strategy that truly
+#     produced it (book/table/qa/general/...), not 'auto' — so a mixed
+#     document's preview shows the real per-run methods.
+
+def _count_title_hits(lines, kind: str) -> int:
+    """How many lines look like structural titles of `kind`."""
+    if kind == 'book':
+        return sum(1 for ln in lines if BOOK_CHAPTER_PATTERN.match(ln.strip()))
+    titles = PAPER_SECTION_TITLES if kind == 'paper' else RESUME_SECTION_TITLES
+    return sum(1 for ln in lines if _is_section_title(ln, titles))
+
+
+def _detect_genre(lines) -> str:
+    """Whole-document genre over prose lines; 'general' when nothing matches.
+    Ties on hit count are broken by book > paper > resume for determinism."""
+    priority = {'book': 3, 'paper': 2, 'resume': 1}
+    hits = {k: _count_title_hits(lines, k) for k in priority}
+    candidates = [k for k in priority if hits[k] > 0]
+    if not candidates:
+        return 'general'
+    return max(candidates, key=lambda k: (hits[k], priority[k]))
+
+
+def _is_sep_row(line: str) -> bool:
+    """A markdown table separator line: only '|', '-', ':', spaces/tabs."""
+    return bool(line) and '|' in line and all(c in '|-: \t' for c in line)
+
+
+def _trim_qa_span(content: str, match) -> int:
+    """Where a Q&A match's answer runs to EOF it swallows any following prose
+    (qa_chunking's regex does this). 'auto' is more conservative: stop the run
+    at the first blank line inside the answer so unrelated paragraphs stay
+    prose instead of being mislabeled as the answer."""
+    body = content[match.start(2):match.end()]
+    gap = re.search(r'\n[ \t]*\n', body)
+    if gap:
+        return match.start(2) + gap.start()
+    return match.end()
+
+
+def _split_by_type(content: str):
+    """Single forward pass over `content` → ordered [(kind, verbatim_slice)].
+    Priority is md_table > csv > qa > prose; every character belongs to exactly
+    one run (whitespace-only prose gaps are dropped)."""
+    lines = content.split('\n')
+    n = len(lines)
+    starts = []
+    acc = 0
+    for ln in lines:
+        starts.append(acc)
+        acc += len(ln) + 1
+
+    def span(i, j):
+        # Verbatim char slice of lines[i:j] (keeps the '\n' separators inside).
+        if j <= i:
+            return None
+        return starts[i], starts[j - 1] + len(lines[j - 1])
+
+    events = []  # (kind, lo, hi) — non-overlapping, sorted later
+
+    def add_event(kind, lo, hi):
+        for _, elo, ehi in events:
+            if lo < ehi and elo < hi:
+                return  # overlapping an earlier island: leave it to prose
+        events.append((kind, lo, hi))
+
+    i = 0
+    while i < n:
+        s = lines[i].strip()
+        if not s:
+            i += 1
+            continue
+
+        # 1) Markdown table: a '|' header line whose next non-blank line is a
+        #    '|-: \t' separator. Data rows are contiguous non-blank '|' lines.
+        if '|' in s:
+            k = i + 1
+            while k < n and k <= i + 4 and not lines[k].strip():
+                k += 1
+            if k < n and _is_sep_row(lines[k].strip()):
+                m = k + 1
+                while m < n and lines[m].strip() and '|' in lines[m] and not _is_sep_row(lines[m].strip()):
+                    m += 1
+                sp = span(i, m)
+                if sp:
+                    add_event('md_table', sp[0], sp[1])
+                i = m
+                continue
+
+        # 2) CSV block: consecutive non-blank ','-bearing lines. Blanks DO end
+        #    the block (a blank paragraph boundary is how prose paragraphs are
+        #    separated; a real CSV rarely has interior blanks). Stricter than
+        #    _looks_like_csv: header + >=2 data rows, so comma-heavy prose
+        #    rarely false-positives into a table.
+        if ',' in s:
+            k = i
+            while k < n and lines[k].strip() and ',' in lines[k]:
+                k += 1
+            block = [ln.strip() for ln in lines[i:k]]
+            if len(block) >= 3 and _looks_like_csv(block):
+                sp = span(i, k)
+                if sp:
+                    add_event('csv', sp[0], sp[1])
+                i = k
+                continue
+
+        i += 1
+
+    # 3) Q&A runs: the SAME regex qa_chunking uses, so boundaries align and a
+    #    pure Q&A document chunks identically. Spans that would cross a
+    #    table/csv island are dropped (their text already belongs to prose).
+    for mt in re.finditer(QA_PATTERN, content, re.DOTALL | re.IGNORECASE):
+        lo, hi = mt.span()
+        if any(lo < ehi and elo < hi for _, elo, ehi in events):
+            continue
+        add_event('qa', lo, _trim_qa_span(content, mt))
+
+    events.sort(key=lambda e: e[1])
+
+    runs = []
+    pos = 0
+    for kind, lo, hi in events:
+        if lo > pos:
+            prose = content[pos:lo]
+            if prose.strip():
+                runs.append(('prose', prose))
+        runs.append((kind, content[lo:hi]))
+        pos = max(pos, hi)
+    if pos < len(content):
+        tail = content[pos:]
+        if tail.strip():
+            runs.append(('prose', tail))
+    return runs
+
+
+def auto_chunking(content: str, params: dict) -> list[dict]:
+    if not content.strip():
+        return []
+    runs = _split_by_type(content)
+    if not runs:
+        return []
+
+    # Whole-document genre pre-detection over the prose body only (tables and
+    # Q&A islands are routed by type, not by genre).
+    prose_lines = []
+    for kind, sl in runs:
+        if kind == 'prose':
+            prose_lines.extend(sl.split('\n'))
+    genre = _detect_genre(prose_lines) if prose_lines else 'general'
+    handler = {
+        'book': book_chunking,
+        'paper': paper_chunking,
+        'resume': resume_chunking,
+        'general': general_chunking,
+    }[genre]
+
+    out = []
+    for kind, sl in runs:  # runs are already in original document order
+        if kind == 'prose':
+            out.extend(handler(sl, params) or general_chunking(sl, params))
+        elif kind == 'md_table':
+            out.extend(_chunk_markdown_table(sl.split('\n')) or general_chunking(sl, params))
+        elif kind == 'csv':
+            out.extend(_chunk_csv_table(sl.split('\n')) or general_chunking(sl, params))
+        else:  # qa
+            out.extend(qa_chunking(sl, params) or general_chunking(sl, params))
+    return out

@@ -1,7 +1,10 @@
 """Unit tests for chunking_strategies.py (pure functions, no DB dependency)."""
 
+import re
+
 from open_webui.utils.chunking_strategies import (
     CHUNKING_METHODS,
+    auto_chunking,
     book_chunking,
     chunk_document,
     extract_keywords,
@@ -187,3 +190,112 @@ class TestGenerateQuestions:
     def test_all_non_empty_strings(self):
         qs = generate_questions('内容', count=2)
         assert all(isinstance(q, str) and q for q in qs)
+
+
+class TestAutoRouting:
+    """'auto' splits a doc into typed runs (md table / csv / qa / prose) and
+    routes each run verbatim to the matching strategy. The verbatim-slice
+    invariant means a SINGLE-TYPE document fed to 'auto' chunks exactly like
+    that type's own strategy — asserted here as full-list equality."""
+
+    @staticmethod
+    def _methods(chunks):
+        return [c['metadata']['method'] for c in chunks]
+
+    def test_empty_and_blank_input(self):
+        assert auto_chunking('', {}) == []
+        assert auto_chunking('\n  \n', {}) == []
+
+    def test_pure_prose_equals_general(self):
+        doc = ('第一段讨论分块与检索的关系，补充若干实现细节。'
+               '\n\n第二段讨论向量化入库，以及状态与向量库不一致的排查思路。')
+        chunks = auto_chunking(doc, {})
+        assert chunks == general_chunking(doc, {})
+        assert self._methods(chunks) == ['general']
+
+    def test_pure_book_equals_book(self):
+        doc = '第一章 引言\n' + ('本书讨论知识库的构建方法与实践。' * 30) + \
+            '\n第二章 系统设计\n' + ('我们设计了分块与检索的主线流程。' * 30)
+        chunks = auto_chunking(doc, {})
+        assert chunks == book_chunking(doc, {})
+        assert all(m == 'book' for m in self._methods(chunks))
+
+    def test_pure_paper_equals_paper(self):
+        doc = ('摘要\n' + ('本文研究检索增强生成的质量评估。' * 5) +
+               '\n方法\n' + ('我们提出基于黄金集的评测框架。' * 5) +
+               '\n结论\n' + ('实验表明评测门禁能拦截回归。' * 5))
+        chunks = auto_chunking(doc, {})
+        assert chunks == paper_chunking(doc, {})
+        assert all(m == 'paper' for m in self._methods(chunks))
+
+    def test_pure_resume_equals_resume(self):
+        doc = ('教育背景\n在某知名大学完成了四年的本科学习\n'
+               '工作经历\n在某科技公司担任高级工程师五年有余')
+        chunks = auto_chunking(doc, {})
+        assert chunks == resume_chunking(doc, {})
+        assert all(m == 'resume' for m in self._methods(chunks))
+
+    def test_pure_markdown_table(self):
+        doc = '| name | age |\n|---|---|\n| alice | 30 |\n| bob | 25 |'
+        chunks = auto_chunking(doc, {})
+        assert chunks == table_chunking(doc, {})
+        assert all(c['metadata']['format'] == 'markdown' for c in chunks)
+        assert any('name: alice' in c['content'] for c in chunks)
+
+    def test_pure_csv_table(self):
+        doc = 'name,age\nalice,30\nbob,25\ncarol,28'
+        chunks = auto_chunking(doc, {})
+        assert chunks == table_chunking(doc, {})
+        assert all(c['metadata']['format'] == 'csv' for c in chunks)
+        assert any('name: bob' in c['content'] for c in chunks)
+
+    def test_pure_qa_equals_qa(self):
+        doc = ('问题：什么是RAG？答案：检索增强生成。\n'
+               '问题：什么是向量？答案：把文本映射成数值向量。')
+        chunks = auto_chunking(doc, {})
+        assert chunks == qa_chunking(doc, {})
+        assert all(m == 'qa' for m in self._methods(chunks))
+
+    def test_mixed_order_and_typed_islands(self):
+        doc = ('这是开头的普通说明文字，介绍知识库的用途与范围。\n\n'
+               '| 名称 | 数量 |\n|---|---|\n| 苹果 | 3 |\n\n'
+               '问题：如何重建索引？\n答案：重跑上传流程。\n\n'
+               '结尾还有一段普通文字作为收束。')
+        chunks = auto_chunking(doc, {})
+        methods = self._methods(chunks)
+        assert methods[0] == 'general'
+        assert methods[-1] == 'general'
+        assert 'table' in methods and 'qa' in methods
+        assert methods.index('table') < methods.index('qa')
+        assert any('苹果' in c['content'] for c in chunks if c['metadata']['method'] == 'table')
+        assert any('重跑上传' in c['content'] for c in chunks if c['metadata']['method'] == 'qa')
+        # 全文正文（去掉分隔符后）既不丢字也不重复
+        joined = ''.join(c['content'] for c in chunks)
+        joined = re.sub(r'\s+', '', joined)
+        raw = re.sub(r'\s+', '', doc)
+        for token in ('开头', '苹果', '重跑上传', '收束'):
+            assert token in joined
+        assert raw.count('苹果') == joined.count('苹果')
+
+    def test_resume_genre_with_table_and_qa(self):
+        doc = ('教育背景\n2019-2023 就读某大学计算机专业。\n'
+               '项目经历\n主导了知识库检索系统的开发。\n\n'
+               '| 技能 | 熟练度 |\n|---|---|\n| Python | 高 |\n\n'
+               '问题：这个系统用了什么架构？\n答案：前后端分离加 RAG。')
+        chunks = auto_chunking(doc, {})
+        assert self._methods(chunks) == ['resume', 'resume', 'table', 'qa']
+        assert any('教育背景' in c['content'] for c in chunks)
+        assert any('Python' in c['content'] for c in chunks)
+        assert any('RAG' in c['content'] for c in chunks)
+
+    def test_stray_question_without_answer_stays_prose(self):
+        doc = '说明文字开头。\n问题：这条没有答案\n继续讲别的内容。'
+        chunks = auto_chunking(doc, {})
+        assert all(m == 'general' for m in self._methods(chunks))
+        assert '没有答案' in ''.join(c['content'] for c in chunks)
+
+    def test_header_only_md_table_falls_back_to_general(self):
+        doc = '| a | b |\n|---|---|'
+        chunks = auto_chunking(doc, {})
+        assert chunks == general_chunking(doc, {})
+        assert any('a' in c['content'] for c in chunks)
